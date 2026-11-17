@@ -1,4 +1,4 @@
-"""Core data types, LLM adapter, ReAct orchestrator, and prompt templates."""
+"""Core data types and universal LLM adapter for Aether Agent."""
 
 from aether_agent.core.types import (
     ChatMessage,

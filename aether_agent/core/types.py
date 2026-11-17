@@ -33,7 +33,8 @@ class ToolCall(BaseModel):
     def parse_arguments(cls, v: Any) -> dict[str, Any]:
         if isinstance(v, str):
             try:
-                return json.loads(v)
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, dict) else {"value": parsed}
             except Exception:
                 return {"raw_input": v}
         if isinstance(v, dict):
@@ -76,7 +77,7 @@ class ChatMessage(BaseModel):
         raise ValueError(f"Invalid role: {v}")
 
     def to_llm_dict(self) -> dict[str, Any]:
-        """Convert ChatMessage into OpenAI/LiteLLM compatible dict."""
+        """Convert ChatMessage into OpenAI-compatible dict."""
         payload: dict[str, Any] = {
             "role": self.role.value,
             "content": self.content or "",

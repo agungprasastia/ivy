@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
@@ -48,18 +49,25 @@ def build_slash_completer() -> WordCompleter:
 
 
 def build_prompt_style(theme: ThemeConfig | None = None) -> Style:
-    """Build prompt_toolkit style matching the active TUI theme."""
+    """Build prompt_toolkit style matching the active TUI theme (noreverse footer)."""
     t = theme or get_theme()
     return Style.from_dict(
         {
             "prompt": f"bold {t.ui_accent}",
-            "bottom-toolbar": f"bg:{t.status_bar_bg} {t.status_bar_text}",
-            "bottom-toolbar.strong": f"bg:{t.status_bar_bg} bold {t.status_bar_strong}",
-            "bottom-toolbar.dim": f"bg:{t.status_bar_bg} {t.status_bar_dim}",
-            "completion-menu": f"bg:{t.completion_bg} {t.status_bar_text}",
-            "completion-menu.completion.current": f"bg:{t.completion_current_bg} bold {t.status_bar_strong}",
-            "completion-menu.meta.completion": f"bg:{t.completion_bg} {t.status_bar_dim}",
-            "completion-menu.meta.completion.current": f"bg:{t.completion_current_bg} {t.status_bar_text}",
+            "bottom-toolbar": f"noreverse bg:default {t.status_bar_text}",
+            "bottom-toolbar.text": f"noreverse bg:default {t.status_bar_text}",
+            "bottom-toolbar.rule": f"noreverse bg:default {t.status_bar_dim}",
+            "bottom-toolbar.strong": f"noreverse bg:default bold {t.status_bar_strong}",
+            "bottom-toolbar.accent": f"noreverse bg:default {t.ui_accent}",
+            "bottom-toolbar.dim": f"noreverse bg:default {t.status_bar_dim}",
+            "completion-menu": f"noreverse bg:{t.completion_bg} {t.status_bar_text}",
+            "completion-menu.completion.current": (
+                f"noreverse bg:{t.completion_current_bg} bold {t.status_bar_strong}"
+            ),
+            "completion-menu.meta.completion": f"noreverse bg:{t.completion_bg} {t.status_bar_dim}",
+            "completion-menu.meta.completion.current": (
+                f"noreverse bg:{t.completion_current_bg} {t.status_bar_text}"
+            ),
         }
     )
 
@@ -70,23 +78,51 @@ def build_bottom_toolbar(
     tool_count: int = 0,
     skill_count: int = 0,
     theme: ThemeConfig | None = None,
-) -> HTML:
-    """Render themed bottom status bar for the prompt_toolkit input."""
+    width: int | None = None,
+) -> FormattedText:
+    """Render Hermes-style two-row clean footer (top rule + split left/right status)."""
     t = theme or get_theme()
-    return HTML(
-        f"<bottom-toolbar.strong> {t.glyph} Ivy </bottom-toolbar.strong>"
-        f"<bottom-toolbar.dim> │ </bottom-toolbar.dim>"
-        f"<bottom-toolbar>{model}</bottom-toolbar>"
-        f"<bottom-toolbar.dim> │ </bottom-toolbar.dim>"
-        f"<bottom-toolbar>session:{session_id}</bottom-toolbar>"
-        f"<bottom-toolbar.dim> │ </bottom-toolbar.dim>"
-        f"<bottom-toolbar.dim>{tool_count} tools · {skill_count} skills · /help · Ctrl+D exit</bottom-toolbar.dim>"
-    )
+    cols = max(40, width or shutil.get_terminal_size((100, 24)).columns)
+
+    left_parts: list[tuple[str, str]] = [
+        ("class:bottom-toolbar.strong", f" {t.glyph} Ivy"),
+        ("class:bottom-toolbar.dim", " · "),
+        ("class:bottom-toolbar.text", model),
+        ("class:bottom-toolbar.dim", " · "),
+        ("class:bottom-toolbar.text", session_id),
+        ("class:bottom-toolbar.dim", f" · {tool_count} tools · {skill_count} skills"),
+    ]
+
+    right_parts: list[tuple[str, str]] = [
+        ("class:bottom-toolbar.strong", "/help"),
+        ("class:bottom-toolbar.dim", " commands · "),
+        ("class:bottom-toolbar.strong", "/theme"),
+        ("class:bottom-toolbar.dim", " skin · "),
+        ("class:bottom-toolbar.strong", "Ctrl+D"),
+        ("class:bottom-toolbar.dim", " exit "),
+    ]
+
+    left_len = sum(len(txt) for _, txt in left_parts)
+    right_len = sum(len(txt) for _, txt in right_parts)
+
+    fragments: list[tuple[str, str]] = [
+        ("class:bottom-toolbar.rule", "─" * cols),
+        ("", "\n"),
+    ]
+    if left_len + right_len + 2 <= cols:
+        pad = " " * (cols - left_len - right_len)
+        fragments.extend(left_parts)
+        fragments.append(("class:bottom-toolbar.dim", pad))
+        fragments.extend(right_parts)
+    else:
+        fragments.extend(left_parts)
+
+    return FormattedText(fragments)
 
 
 def create_prompt_session(
     theme: ThemeConfig | None = None,
-    bottom_toolbar: Callable[[], HTML] | None = None,
+    bottom_toolbar: Callable[[], FormattedText] | None = None,
 ) -> PromptSession[str]:
     """Create an interactive prompt_toolkit session with themed chrome and completion."""
     return PromptSession(

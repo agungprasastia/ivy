@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Sequence
 
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText, HTML
 from rich.console import Console
 
 from ivy.config import IvyConfig, load_config
@@ -157,7 +157,7 @@ class IvyCLIApp:
         except Exception:
             return []
 
-    def _render_toolbar(self) -> HTML:
+    def _render_toolbar(self) -> FormattedText:
         return build_bottom_toolbar(
             model=self.llm_client.model,
             session_id=self.session_id,

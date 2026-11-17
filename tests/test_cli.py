@@ -205,3 +205,28 @@ async def test_tui_theme_switch_and_friendly_auth_error(tmp_path):
     assert "hermes" in buf.getvalue().lower()
 
     await store.close()
+
+
+def test_footer_style_disables_reverse_and_renders_clean_split():
+    from ivy.tui.prompt import build_bottom_toolbar, build_prompt_style
+    from ivy.tui.theme import get_theme
+
+    theme = get_theme("ivy")
+    style = build_prompt_style(theme)
+    rules = dict(style.style_rules)
+    assert "noreverse" in rules.get("bottom-toolbar", "")
+    assert "noreverse" in rules.get("bottom-toolbar.text", "")
+
+    toolbar = build_bottom_toolbar(
+        model="gpt-4o-mini",
+        session_id="cli:main",
+        tool_count=10,
+        skill_count=2,
+        theme=theme,
+        width=100,
+    )
+    rendered = "".join(text for _, text in toolbar)
+    assert "─" in rendered
+    assert "gpt-4o-mini" in rendered
+    assert "cli:main" in rendered
+    assert "/help" in rendered

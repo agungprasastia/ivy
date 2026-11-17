@@ -33,6 +33,8 @@ class LLMClient:
         self.provider, self.resolved_model, self.base_url = self._resolve_provider(
             self.model
         )
+        self._openai_clients: dict[tuple[str, str | None], AsyncOpenAI] = {}
+        self._anthropic_clients: dict[tuple[str, str | None], AsyncAnthropic] = {}
 
     def set_model(self, model: str) -> None:
         """Switch active model and recompute provider routing."""
@@ -71,17 +73,34 @@ class LLMClient:
 
     def _get_openai_client(self) -> AsyncOpenAI:
         api_key = self._resolve_api_key(self.provider)
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-        return AsyncOpenAI(**kwargs)
+        cache_key = (api_key, self.base_url)
+        client = self._openai_clients.get(cache_key)
+        if client is None:
+            kwargs: dict[str, Any] = {"api_key": api_key}
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            client = AsyncOpenAI(**kwargs)
+            self._openai_clients[cache_key] = client
+        return client
 
     def _get_anthropic_client(self) -> AsyncAnthropic:
         api_key = self._resolve_api_key("anthropic")
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-        return AsyncAnthropic(**kwargs)
+        cache_key = (api_key, self.base_url)
+        client = self._anthropic_clients.get(cache_key)
+        if client is None:
+            kwargs: dict[str, Any] = {"api_key": api_key}
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            client = AsyncAnthropic(**kwargs)
+            self._anthropic_clients[cache_key] = client
+        return client
+
+    async def close(self) -> None:
+        """Close all cached HTTP SDK clients."""
+        for client in list(self._openai_clients.values()) + list(self._anthropic_clients.values()):
+            await client.close()
+        self._openai_clients.clear()
+        self._anthropic_clients.clear()
 
     def _format_openai_messages(
         self, messages: list[ChatMessage | dict[str, Any]]
@@ -117,18 +136,19 @@ class LLMClient:
                 if msg.content:
                     system_parts.append(msg.content)
             elif msg.role == Role.TOOL:
-                formatted.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": msg.tool_call_id or "",
-                                "content": msg.content or "",
-                            }
-                        ],
-                    }
-                )
+                tool_block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id or "",
+                    "content": msg.content or "",
+                }
+                if (
+                    formatted
+                    and formatted[-1]["role"] == "user"
+                    and isinstance(formatted[-1]["content"], list)
+                ):
+                    formatted[-1]["content"].append(tool_block)
+                else:
+                    formatted.append({"role": "user", "content": [tool_block]})
             elif msg.role == Role.ASSISTANT and msg.tool_calls:
                 blocks: list[dict[str, Any]] = []
                 if msg.content:
@@ -144,9 +164,24 @@ class LLMClient:
                     )
                 formatted.append({"role": "assistant", "content": blocks})
             else:
-                formatted.append(
-                    {"role": msg.role.value, "content": msg.content or ""}
-                )
+                if (
+                    msg.role == Role.USER
+                    and formatted
+                    and formatted[-1]["role"] == "user"
+                    and isinstance(formatted[-1]["content"], str)
+                ):
+                    formatted[-1]["content"] = (
+                        f"{formatted[-1]['content']}\n\n{msg.content or ''}".strip()
+                    )
+                else:
+                    formatted.append(
+                        {"role": msg.role.value, "content": msg.content or ""}
+                    )
+
+        if formatted and formatted[0]["role"] != "user":
+            formatted.insert(
+                0, {"role": "user", "content": "[Continued conversation context]"}
+            )
 
         anthropic_tools: list[dict[str, Any]] | None = None
         if tools:

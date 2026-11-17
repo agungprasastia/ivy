@@ -71,11 +71,15 @@ class SkillEngine:
 
     def save_skill(self, skill: SkillDefinition) -> Path:
         """Write a skill to skills_dir/<slug>/SKILL.md and register it."""
-        slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", skill.name.strip()).strip("-")
-        if not slug:
-            raise ValueError("Skill name must contain alphanumeric characters")
+        slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", skill.name.strip()).strip("-.")
+        if not slug or slug in (".", ".."):
+            raise ValueError("Skill name must contain valid alphanumeric characters")
 
-        target_dir = self.skills_dir / slug
+        base_resolved = self.skills_dir.resolve()
+        target_dir = (self.skills_dir / slug).resolve()
+        if target_dir.parent != base_resolved:
+            raise ValueError(f"Invalid skill path traversal detected for {skill.name!r}")
+
         target_dir.mkdir(parents=True, exist_ok=True)
         skill_file = target_dir / "SKILL.md"
         skill_file.write_text(serialize_skill_markdown(skill), encoding="utf-8")

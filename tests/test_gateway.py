@@ -75,3 +75,49 @@ def test_bot_adapters_whitelist_check():
     # Empty whitelist must fail-closed for remote bot adapters
     tg_empty = TelegramAdapter(token="fake", allowed_users=[])
     assert tg_empty.is_authorized("123") is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_routes_approval_to_adapter_and_cron_stays_unattended():
+    from aether_agent.gateway.adapters.base import BaseAdapter
+    from aether_agent.tools.approval import SafetyApprovalPolicy
+
+    class DummyAdapter(BaseAdapter):
+        platform_name = "telegram"
+
+        def __init__(self):
+            super().__init__(allowed_users=["1001"])
+            self.approval_requests = []
+
+        async def start(self, handler):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def send_message(self, target_id: str, text: str):
+            return None
+
+        async def request_approval(self, target_id: str, command: str, timeout: float = 60.0) -> bool:
+            self.approval_requests.append((target_id, command))
+            return True
+
+    policy = SafetyApprovalPolicy(auto_approve=False, unattended=False)
+    adapter = DummyAdapter()
+
+    class ApprovalAwareAgent:
+        async def run_turn(self, prompt: str, session_id: str = "default", platform: str = "cli"):
+            approved = await policy.check_approval("rm -rf /tmp/demo")
+            return ChatMessage(role=Role.ASSISTANT, content=f"approved={approved}")
+
+    cfg = AetherConfig(allowed_users=["1001"])
+    server = GatewayServer(agent=ApprovalAwareAgent(), config=cfg, approval_policy=policy)
+    server.register_adapter(adapter)
+
+    res = await server.handle_incoming(platform="telegram", user_id="1001", text="clean")
+    assert res == "approved=True"
+    assert adapter.approval_requests == [("1001", "rm -rf /tmp/demo")]
+
+    # Outside adapter context with unattended=True (Cron mode), dangerous command is rejected
+    cron_policy = SafetyApprovalPolicy(auto_approve=False, unattended=True)
+    assert await cron_policy.check_approval("rm -rf /tmp/demo") is False

@@ -48,7 +48,7 @@ class SkillGenerator:
         if not isinstance(response, ChatMessage):
             return None
 
-        raw = (response.content or "").strip()
+        raw = (response.content or "").replace("\r\n", "\n").strip()
         if not raw or raw == "NO_SKILL":
             return None
 

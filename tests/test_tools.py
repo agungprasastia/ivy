@@ -194,3 +194,48 @@ async def test_web_tools_extract_and_search(monkeypatch):
 
     search = WebSearchTool()
     assert search.get_schema()["function"]["name"] == "web_search"
+
+
+def test_safety_guard_catches_powershell_aliases_and_rm_r():
+    policy = SafetyApprovalPolicy(auto_approve=False)
+    for cmd in [
+        r"rm -Recurse C:\temp\target",
+        r"del -Force C:\temp\target",
+        r"ri -r -fo C:\temp\target",
+        "rm -r /tmp/target",
+        r"del /q /f C:\temp\*",
+    ]:
+        assert policy.is_dangerous(cmd) is True, f"Expected dangerous: {cmd}"
+
+
+@pytest.mark.asyncio
+async def test_code_runner_cleanup_on_cancel():
+    import sys
+
+    runner = CodeRunnerTool(timeout=10.0)
+    started = []
+    orig_exec = asyncio.create_subprocess_exec
+    procs = []
+
+    async def spy_exec(*args, **kwargs):
+        proc = await orig_exec(*args, **kwargs)
+        if args and args[0] == sys.executable:
+            procs.append(proc)
+            started.append(True)
+        return proc
+
+    code = "import time\nwhile True:\n    time.sleep(0.05)"
+    old_exec = asyncio.create_subprocess_exec
+    asyncio.create_subprocess_exec = spy_exec
+    try:
+        task = asyncio.create_task(runner.execute(code=code))
+        while not started:
+            await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        asyncio.create_subprocess_exec = old_exec
+
+    assert len(procs) == 1
+    assert procs[0].returncode is not None

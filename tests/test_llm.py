@@ -214,3 +214,48 @@ async def test_llm_client_streaming():
         )
         chunks = [chunk async for chunk in stream]
         assert "".join(chunks) == "Hello Aether"
+
+
+def test_anthropic_coalesces_parallel_tool_results_and_compressed_history():
+    cfg = AetherConfig(default_model="claude-sonnet-4-5", anthropic_api_key="sk-ant")
+    client = LLMClient(cfg)
+
+    messages = [
+        ChatMessage(role=Role.SYSTEM, content="System prompt"),
+        ChatMessage(role=Role.SYSTEM, content="[Compressed 4 earlier messages]"),
+        ChatMessage(
+            role=Role.ASSISTANT,
+            content="Running two tools",
+            tool_calls=[
+                ToolCall(id="tc_1", function_name="read_file", arguments={"path": "a.txt"}),
+                ToolCall(id="tc_2", function_name="read_file", arguments={"path": "b.txt"}),
+            ],
+        ),
+        ChatMessage(role=Role.TOOL, tool_call_id="tc_1", name="read_file", content="A"),
+        ChatMessage(role=Role.TOOL, tool_call_id="tc_2", name="read_file", content="B"),
+    ]
+    system_prompt, formatted, _ = client._format_anthropic_payload(messages)
+    assert system_prompt is not None
+    assert formatted[0]["role"] == "user"
+    # Assistant message followed by ONE user message containing both tool_result blocks
+    tool_user_msgs = [
+        m for m in formatted
+        if m["role"] == "user" and isinstance(m["content"], list)
+    ]
+    assert len(tool_user_msgs) == 1
+    assert len(tool_user_msgs[0]["content"]) == 2
+    assert [b["tool_use_id"] for b in tool_user_msgs[0]["content"]] == ["tc_1", "tc_2"]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_reuses_and_closes_clients():
+    cfg = AetherConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    client = LLMClient(cfg)
+
+    c1 = client._get_openai_client()
+    c2 = client._get_openai_client()
+    assert c1 is c2
+
+    with patch.object(c1, "close", new=AsyncMock()) as mock_close:
+        await client.close()
+        assert mock_close.called

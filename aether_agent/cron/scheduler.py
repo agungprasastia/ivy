@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from aether_agent.cron.task import ScheduledTask
 from aether_agent.memory.store import MemoryStore
+from aether_agent.tools.approval import SafetyApprovalPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +23,13 @@ class CronScheduler:
         agent: Any | None = None,
         memory_store: MemoryStore | None = None,
         dispatcher: Callable[[str, str, str], Any | Awaitable[Any]] | None = None,
+        approval_policy: SafetyApprovalPolicy | None = None,
         poll_interval: float = 15.0,
     ) -> None:
         self.agent = agent
         self.memory_store = memory_store
         self.dispatcher = dispatcher
+        self.approval_policy = approval_policy
         self.poll_interval = poll_interval
         self._tasks: dict[str, ScheduledTask] = {}
         self._runner_task: asyncio.Task[None] | None = None
@@ -62,11 +65,19 @@ class CronScheduler:
                     res = await res
                 output_text = "" if res is None else str(res)
             elif task.prompt and self.agent is not None:
-                reply = await self.agent.run_turn(
-                    prompt=task.prompt,
-                    session_id=f"cron:{task.name}",
-                    platform="cron",
-                )
+                if self.approval_policy is not None:
+                    async with self.approval_policy.scoped_context(unattended=True):
+                        reply = await self.agent.run_turn(
+                            prompt=task.prompt,
+                            session_id=f"cron:{task.name}",
+                            platform="cron",
+                        )
+                else:
+                    reply = await self.agent.run_turn(
+                        prompt=task.prompt,
+                        session_id=f"cron:{task.name}",
+                        platform="cron",
+                    )
                 output_text = getattr(reply, "content", "") or ""
             else:
                 status = "skipped"

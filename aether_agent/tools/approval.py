@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import inspect
 import logging
 import re
 import sys
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+_ApprovalCallback = Callable[[str], bool | Awaitable[bool]]
+_scoped_callback_var: contextvars.ContextVar[_ApprovalCallback | None] = (
+    contextvars.ContextVar("aether_scoped_approval_callback", default=None)
+)
+_scoped_unattended_var: contextvars.ContextVar[bool | None] = (
+    contextvars.ContextVar("aether_scoped_unattended", default=None)
+)
 
 
 class SafetyApprovalPolicy:
@@ -17,19 +27,20 @@ class SafetyApprovalPolicy:
 
     DEFAULT_DANGEROUS_PATTERNS = [
         # POSIX destructive patterns
+        r"\brm\b.*\s+(?:-[a-zA-Z]*[rR]|--recursive)\b",
         r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b",
-        r"\brm\b.*\s+-[a-zA-Z]*r\b.*\s+-[a-zA-Z]*f\b",
-        r"\brm\b.*\s+-[a-zA-Z]*f\b.*\s+-[a-zA-Z]*r\b",
         r"\bmkfs(\.[a-zA-Z0-9]+)?\b",
         r"\bdd\s+if=",
         r">\s*/dev/sd[a-z]",
         r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\};:",  # fork bomb
         # Windows / DOS destructive patterns
-        r"\bdel\b(?:\s+/[a-zA-Z]+)*\s+/[a-zA-Z]*[sS]\b",
+        r"\b(?:del|erase)\b(?:\s+/[a-zA-Z]+)*\s+/[a-zA-Z]*[sS]\b",
+        r"\b(?:del|erase)\b.*\s+/[qQ]\b.*\s+/[fF]\b",
+        r"\b(?:del|erase)\b.*\s+/[fF]\b.*\s+/[qQ]\b",
         r"\b(?:rmdir|rd)\b(?:\s+/[a-zA-Z]+)*\s+/[sS]\b",
         r"\bformat\s+[a-zA-Z]:",
-        # PowerShell destructive patterns
-        r"\bRemove-Item\b.*(-Recurse|-Force)",
+        # PowerShell Remove-Item and aliases (rm, del, rd, rmdir, ri, erase)
+        r"\b(?:Remove-Item|rm|del|rd|rmdir|ri|erase)\b.*\s+-(?:Recurse|Force|r|fo)\b",
         r"\bClear-Disk\b",
         r"\bFormat-Volume\b",
     ]
@@ -40,7 +51,7 @@ class SafetyApprovalPolicy:
         interactive: bool = False,
         unattended: bool = False,
         approval_timeout: float = 60.0,
-        approval_callback: Callable[[str], bool | Awaitable[bool]] | None = None,
+        approval_callback: _ApprovalCallback | None = None,
         custom_dangerous_patterns: list[str] | None = None,
     ) -> None:
         self.auto_approve = auto_approve
@@ -53,6 +64,21 @@ class SafetyApprovalPolicy:
         if custom_dangerous_patterns:
             patterns.extend(custom_dangerous_patterns)
         self.compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
+
+    @contextlib.asynccontextmanager
+    async def scoped_context(
+        self,
+        approval_callback: _ApprovalCallback | None = None,
+        unattended: bool | None = None,
+    ) -> AsyncIterator[None]:
+        """Temporarily override approval callback or unattended mode for current async task."""
+        cb_tok = _scoped_callback_var.set(approval_callback)
+        un_tok = _scoped_unattended_var.set(unattended)
+        try:
+            yield
+        finally:
+            _scoped_callback_var.reset(cb_tok)
+            _scoped_unattended_var.reset(un_tok)
 
     def is_dangerous(self, command: str) -> bool:
         """Check whether a command matches any dangerous destructive patterns."""
@@ -67,20 +93,26 @@ class SafetyApprovalPolicy:
         if self.auto_approve:
             return True
 
-        if self.unattended:
+        scoped_unattended = _scoped_unattended_var.get()
+        is_unattended = self.unattended if scoped_unattended is None else scoped_unattended
+        if is_unattended:
             logger.warning(
                 "Unattended safety policy blocked dangerous command: %s", command
             )
             return False
 
-        if self.approval_callback is not None:
+        callback = _scoped_callback_var.get() or self.approval_callback
+        if callback is not None:
             try:
-                res = self.approval_callback(command)
+                res = callback(command)
                 if inspect.isawaitable(res):
                     return bool(await asyncio.wait_for(res, timeout=self.approval_timeout))
                 return bool(res)
             except asyncio.TimeoutError:
                 logger.warning("Approval request timed out for command: %s", command)
+                return False
+            except Exception as exc:
+                logger.warning("Approval callback failed safely (rejecting): %s", exc)
                 return False
 
         if self.interactive and sys.stdin.isatty():

@@ -31,3 +31,25 @@ def test_load_config_from_env(monkeypatch):
     assert config.allowed_users == ["user1", "user2", "user3"]
     assert config.telegram_token == "fake_tg_token"
     assert config.discord_token == "fake_dc_token"
+
+
+def test_isolated_subpackage_imports():
+    import subprocess
+    import sys
+
+    for pkg in [
+        "aether_agent.tools",
+        "aether_agent.memory",
+        "aether_agent.cron",
+        "aether_agent.gateway",
+        "aether_agent.skills",
+        "aether_agent.core",
+        "aether_agent.tui",
+    ]:
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {pkg}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"Failed importing {pkg}: {proc.stderr}"

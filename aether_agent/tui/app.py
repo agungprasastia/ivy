@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from typing import Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from rich.console import Console
 
@@ -16,6 +16,8 @@ from aether_agent.cron.scheduler import CronScheduler
 from aether_agent.gateway.server import GatewayServer
 from aether_agent.memory.store import MemoryStore
 from aether_agent.skills.engine import SkillEngine
+from aether_agent.skills.generator import SkillGenerator
+from aether_agent.skills.tool import ReadSkillTool
 from aether_agent.tools.approval import SafetyApprovalPolicy
 from aether_agent.tools.files import FileTools
 from aether_agent.tools.registry import ToolRegistry
@@ -45,17 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # `aether gateway start|status`
     gw_parser = subparsers.add_parser("gateway", help="Manage multi-platform messaging gateway")
     gw_sub = gw_parser.add_subparsers(dest="gateway_action")
     gw_sub.add_parser("start", help="Start the async messaging gateway & cron daemon")
     gw_sub.add_parser("status", help="Show configured gateway adapters")
 
-    # `aether model [name]`
     model_parser = subparsers.add_parser("model", help="Show or test configured model")
     model_parser.add_argument("model_name", nargs="?", default=None, help="Model name")
 
-    # `aether skills list|inspect|remove`
     skills_parser = subparsers.add_parser("skills", help="Inspect and manage learned skills")
     skills_sub = skills_parser.add_subparsers(dest="skills_action")
     skills_sub.add_parser("list", help="List available skills")
@@ -64,7 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p = skills_sub.add_parser("remove", help="Remove a skill")
     remove_p.add_argument("name", help="Skill name")
 
-    # `aether cron list`
     cron_parser = subparsers.add_parser("cron", help="Inspect scheduled cron tasks")
     cron_sub = cron_parser.add_subparsers(dest="cron_action")
     cron_sub.add_parser("list", help="List scheduled tasks")
@@ -73,20 +71,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_default_tool_registry(
-    config: AetherConfig, interactive: bool = True, unattended: bool = False
+    config: AetherConfig,
+    interactive: bool = True,
+    unattended: bool = False,
+    skill_engine: SkillEngine | None = None,
+    approval_callback: Callable[[str], bool | Awaitable[bool]] | None = None,
+    approval_policy: SafetyApprovalPolicy | None = None,
 ) -> ToolRegistry:
     """Create and populate the default ToolRegistry."""
     registry = ToolRegistry()
-    policy = SafetyApprovalPolicy(
+    policy = approval_policy or SafetyApprovalPolicy(
         auto_approve=config.auto_approve_safety,
         interactive=interactive,
         unattended=unattended,
+        approval_callback=approval_callback,
     )
     registry.register(TerminalTool(approval_policy=policy))
     FileTools().register_all(registry)
     registry.register(CodeRunnerTool(timeout=config.code_runner_timeout))
     registry.register(WebFetchTool())
     registry.register(WebSearchTool())
+    if skill_engine is not None:
+        registry.register(ReadSkillTool(skill_engine=skill_engine))
     return registry
 
 
@@ -100,6 +106,7 @@ class AetherCLIApp:
         memory_store: MemoryStore,
         skill_engine: SkillEngine,
         agent: AetherAgent,
+        skill_generator: SkillGenerator | None = None,
         cron_scheduler: CronScheduler | None = None,
         session_id: str = "cli:main",
         console: Console | None = None,
@@ -109,9 +116,30 @@ class AetherCLIApp:
         self.memory_store = memory_store
         self.skill_engine = skill_engine
         self.agent = agent
+        self.skill_generator = skill_generator
         self.cron_scheduler = cron_scheduler or CronScheduler()
         self.session_id = session_id
         self.console = console or create_console()
+        self._active_status: Any = None
+
+    async def _interactive_approval(self, command: str) -> bool:
+        """Pause any active Rich spinner before asking the terminal user for approval."""
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            self.console.print(
+                f"\n[bold yellow][SAFETY GUARD][/bold yellow] Potentially destructive command:\n  {command}"
+            )
+            answer = await asyncio.to_thread(
+                lambda: input("Approve execution? [y/N]: ").strip().lower()
+            )
+            return answer in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        finally:
+            if status is not None:
+                status.start()
 
     async def handle_slash_command(self, raw_line: str) -> bool:
         """Handle a slash command. Returns False to exit interactive loop."""
@@ -125,7 +153,7 @@ class AetherCLIApp:
 
         if cmd == "/help":
             self.console.print(
-                "/model <name> | /skills list|inspect <name>|remove <name> | "
+                "/model <name> | /skills list|inspect <name>|remove <name>|reflect | "
                 "/memory <query> | /cron list | /gateway status | /clear | /exit"
             )
             return True
@@ -167,8 +195,18 @@ class AetherCLIApp:
                 removed = self.skill_engine.remove_skill(args[1])
                 msg = f"Removed skill '{args[1]}'" if removed else f"Skill '{args[1]}' not found"
                 self.console.print(msg)
+            elif action == "reflect":
+                if self.skill_generator is None:
+                    self.console.print("[yellow]Skill reflection is not configured.[/yellow]")
+                else:
+                    history = await self.memory_store.get_messages(self.session_id)
+                    created = await self.skill_generator.reflect_and_create(history)
+                    if created is not None:
+                        self.console.print(f"[green]Created skill:[/green] {created.name}")
+                    else:
+                        self.console.print("[dim]No reusable skill extracted from this session.[/dim]")
             else:
-                self.console.print("[yellow]Usage: /skills [list | inspect <name> | remove <name>][/yellow]")
+                self.console.print("[yellow]Usage: /skills [list | inspect <name> | remove <name> | reflect][/yellow]")
             return True
 
         if cmd == "/cron":
@@ -211,13 +249,20 @@ class AetherCLIApp:
                     break
                 continue
 
-            with self.console.status("[cyan]Thinking...[/cyan]"):
-                reply = await self.agent.run_turn(
-                    prompt=text,
-                    session_id=self.session_id,
-                    tool_callback=lambda ev: render_tool_event(self.console, ev),
-                )
-            render_assistant_reply(self.console, reply.content or "")
+            status = self.console.status("[cyan]Thinking...[/cyan]")
+            self._active_status = status
+            try:
+                with status:
+                    reply = await self.agent.run_turn(
+                        prompt=text,
+                        session_id=self.session_id,
+                        tool_callback=lambda ev: render_tool_event(self.console, ev),
+                    )
+                render_assistant_reply(self.console, reply.content or "")
+            except Exception as exc:
+                self.console.print(f"[red]Error during turn:[/red] {exc}")
+            finally:
+                self._active_status = None
 
 
 async def _run_async(args: argparse.Namespace) -> int:
@@ -235,6 +280,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     skills = SkillEngine(skills_dir=config.skills_dir)
     await skills.load_skills()
     llm = LLMClient(config=config)
+    skill_gen = SkillGenerator(llm_client=llm, skill_engine=skills)
     console = create_console()
 
     try:
@@ -261,18 +307,37 @@ async def _run_async(args: argparse.Namespace) -> int:
 
         if args.command == "gateway":
             action = args.gateway_action or "status"
+            gw_policy = SafetyApprovalPolicy(
+                auto_approve=config.auto_approve_safety,
+                interactive=False,
+                unattended=False,
+            )
             registry = build_default_tool_registry(
-                config, interactive=False, unattended=True
+                config,
+                interactive=False,
+                unattended=False,
+                skill_engine=skills,
+                approval_policy=gw_policy,
             )
             agent = AetherAgent(
                 llm_client=llm,
                 tool_registry=registry,
                 memory_store=store,
                 skill_engine=skills,
+                skill_generator=skill_gen,
                 config=config,
             )
-            cron = CronScheduler(agent=agent, memory_store=store)
-            gw = GatewayServer(agent=agent, config=config, cron_scheduler=cron)
+            cron = CronScheduler(
+                agent=agent,
+                memory_store=store,
+                approval_policy=gw_policy,
+            )
+            gw = GatewayServer(
+                agent=agent,
+                config=config,
+                cron_scheduler=cron,
+                approval_policy=gw_policy,
+            )
             cron.dispatcher = gw.dispatch
             gw.configure_default_adapters()
 
@@ -289,12 +354,24 @@ async def _run_async(args: argparse.Namespace) -> int:
                 await gw.stop()
             return 0
 
-        registry = build_default_tool_registry(config, interactive=True, unattended=False)
+        cli_policy = SafetyApprovalPolicy(
+            auto_approve=config.auto_approve_safety,
+            interactive=True,
+            unattended=False,
+        )
+        registry = build_default_tool_registry(
+            config,
+            interactive=True,
+            unattended=False,
+            skill_engine=skills,
+            approval_policy=cli_policy,
+        )
         agent = AetherAgent(
             llm_client=llm,
             tool_registry=registry,
             memory_store=store,
             skill_engine=skills,
+            skill_generator=skill_gen,
             config=config,
         )
         app = AetherCLIApp(
@@ -303,9 +380,11 @@ async def _run_async(args: argparse.Namespace) -> int:
             memory_store=store,
             skill_engine=skills,
             agent=agent,
+            skill_generator=skill_gen,
             session_id=args.session,
             console=console,
         )
+        cli_policy.approval_callback = app._interactive_approval
         if args.command == "cron":
             await app.handle_slash_command("/cron list")
             return 0
@@ -313,6 +392,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         await app.run_interactive()
         return 0
     finally:
+        await llm.close()
         await store.close()
 
 

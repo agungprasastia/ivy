@@ -12,6 +12,7 @@ from aether_agent.gateway.adapters.discord_adapter import DiscordAdapter
 from aether_agent.gateway.adapters.telegram_adapter import TelegramAdapter
 from aether_agent.gateway.session_hub import SessionHub
 from aether_agent.gateway.turn_lease import TurnLeaseManager
+from aether_agent.tools.approval import SafetyApprovalPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,14 @@ class GatewayServer:
         cron_scheduler: CronScheduler | None = None,
         lease_manager: TurnLeaseManager | None = None,
         session_hub: SessionHub | None = None,
+        approval_policy: SafetyApprovalPolicy | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.cron_scheduler = cron_scheduler
         self.lease_manager = lease_manager or TurnLeaseManager()
         self.session_hub = session_hub or SessionHub()
+        self.approval_policy = approval_policy
         self._adapters: dict[str, BaseAdapter] = {}
         self._allowed_users = {str(u).strip() for u in config.allowed_users if str(u).strip()}
 
@@ -100,12 +103,24 @@ class GatewayServer:
         if not acquired:
             return "Session is busy processing another turn. Please try again shortly."
 
+        adapter = self._adapters.get(platform.lower())
         try:
-            reply = await self.agent.run_turn(
-                prompt=text,
-                session_id=resolved_session,
-                platform=platform.lower(),
-            )
+            if self.approval_policy is not None and adapter is not None:
+                async with self.approval_policy.scoped_context(
+                    approval_callback=lambda cmd: adapter.request_approval(user_id, cmd),
+                    unattended=False,
+                ):
+                    reply = await self.agent.run_turn(
+                        prompt=text,
+                        session_id=resolved_session,
+                        platform=platform.lower(),
+                    )
+            else:
+                reply = await self.agent.run_turn(
+                    prompt=text,
+                    session_id=resolved_session,
+                    platform=platform.lower(),
+                )
             return getattr(reply, "content", "") or ""
         finally:
             await self.lease_manager.release(resolved_session)

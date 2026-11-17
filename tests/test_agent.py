@@ -170,3 +170,37 @@ async def test_subagent_runner_isolation(tmp_path):
     fts_hits = await store.search_fts("Analyze logs")
     assert len(fts_hits) == 0
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_auto_reflects_after_tool_turn(tmp_path):
+    from aether_agent.skills.generator import SkillGenerator
+
+    skills = SkillEngine(skills_dir=str(tmp_path / "skills"))
+    mock_llm = MagicMock()
+    mock_llm.chat_completion = AsyncMock(
+        side_effect=[
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(id="c1", function_name="terminal", arguments={"command": "echo hi"})
+                ],
+            ),
+            ChatMessage(role=Role.ASSISTANT, content="Done."),
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="---\nname: echo-check\ndescription: Echo check\nstatus: draft\n---\n1. Run echo\n",
+            ),
+        ]
+    )
+    mock_tools = MagicMock()
+    mock_tools.execute = AsyncMock(
+        return_value=ToolResult(tool_call_id="c1", tool_name="terminal", status="success", output="hi")
+    )
+    mock_tools.get_schemas = MagicMock(return_value=[])
+
+    gen = SkillGenerator(llm_client=mock_llm, skill_engine=skills)
+    agent = AetherAgent(llm_client=mock_llm, tool_registry=mock_tools, skill_generator=gen)
+    await agent.run_turn(prompt="Echo hi", session_id="s-reflect")
+    assert skills.inspect_skill("echo-check") is not None

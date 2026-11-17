@@ -66,16 +66,20 @@ def parse_skill_markdown(text: str) -> SkillDefinition:
     )
 
 
+def _collapse_scalar(value: Any) -> str:
+    return " ".join(str(value).splitlines()).strip()
+
+
 def serialize_skill_markdown(skill: SkillDefinition) -> str:
     """Serialize a SkillDefinition into agentskills.io SKILL.md text."""
     lines = [
         "---",
-        f"name: {skill.name}",
-        f"description: {skill.description}",
-        f"status: {skill.status}",
+        f"name: {_collapse_scalar(skill.name)}",
+        f"description: {_collapse_scalar(skill.description)}",
+        f"status: {_collapse_scalar(skill.status)}",
     ]
     for key, val in skill.metadata.items():
-        lines.append(f"{key}: {val}")
+        lines.append(f"{_collapse_scalar(key)}: {_collapse_scalar(val)}")
     lines.append("---")
     if skill.instructions:
         lines.append(skill.instructions.strip())

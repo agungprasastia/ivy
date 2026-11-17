@@ -13,6 +13,7 @@ from aether_agent.core.types import ChatMessage, Role
 from aether_agent.memory.context import ContextWindowManager
 from aether_agent.memory.store import MemoryStore
 from aether_agent.skills.engine import SkillEngine
+from aether_agent.skills.generator import SkillGenerator
 from aether_agent.tools.registry import ToolRegistry
 
 
@@ -25,6 +26,7 @@ class AetherAgent:
         tool_registry: ToolRegistry,
         memory_store: MemoryStore | None = None,
         skill_engine: SkillEngine | None = None,
+        skill_generator: SkillGenerator | None = None,
         config: AetherConfig | None = None,
         max_iterations: int | None = None,
         exclude_from_fts: bool = False,
@@ -34,6 +36,7 @@ class AetherAgent:
         self.tool_registry = tool_registry
         self.memory_store = memory_store
         self.skill_engine = skill_engine
+        self.skill_generator = skill_generator
         self.config = config
         self.max_iterations = max_iterations or (
             config.max_iterations if config else 15
@@ -104,6 +107,7 @@ class AetherAgent:
             messages = self._fallback_context_mgr.compress(messages)
 
         schemas = self.tool_registry.get_schemas() or None
+        used_tools = False
 
         for _ in range(self.max_iterations):
             reply = await self.llm_client.chat_completion(
@@ -119,9 +123,16 @@ class AetherAgent:
             messages.append(reply)
 
             if not reply.tool_calls:
+                if used_tools and self.skill_generator is not None and not self.exclude_from_fts:
+                    try:
+                        await self.skill_generator.reflect_and_create(messages)
+                    except Exception:
+                        pass
                 if reply.content:
                     await self._emit(stream_callback, reply.content)
                 return reply
+
+            used_tools = True
 
             for tc in reply.tool_calls:
                 await self._emit(

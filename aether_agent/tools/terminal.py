@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import platform
+import subprocess
 from typing import Any
 
 from aether_agent.core.types import ToolResult
 from aether_agent.tools.approval import SafetyApprovalPolicy
 from aether_agent.tools.base import BaseTool
+from aether_agent.tools.runner import terminate_process_tree
 
 
 class TerminalTool(BaseTool):
@@ -73,24 +75,24 @@ class TerminalTool(BaseTool):
 
         proc: asyncio.subprocess.Process | None = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *shell_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=working_dir,
-            )
+            exec_kwargs: dict[str, Any] = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": working_dir,
+            }
+            if platform.system() == "Windows":
+                exec_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                exec_kwargs["start_new_session"] = True
+
+            proc = await asyncio.create_subprocess_exec(*shell_cmd, **exec_kwargs)
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError:
-            if proc is not None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
+            await terminate_process_tree(proc)
             return ToolResult(
                 tool_name=self.name,
                 status="error",
@@ -98,12 +100,15 @@ class TerminalTool(BaseTool):
                 output="",
             )
         except Exception as exc:
+            await terminate_process_tree(proc)
             return ToolResult(
                 tool_name=self.name,
                 status="error",
                 error=f"Failed to execute process: {exc}",
                 output="",
             )
+        finally:
+            await terminate_process_tree(proc)
 
         stdout_str = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()

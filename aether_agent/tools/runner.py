@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import platform
+import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -10,6 +14,41 @@ from typing import Any
 
 from aether_agent.core.types import ToolResult
 from aether_agent.tools.base import BaseTool
+
+
+async def terminate_process_tree(proc: asyncio.subprocess.Process | None) -> None:
+    """Terminate a subprocess and its descendants cleanly across Windows and POSIX."""
+    if proc is None or proc.returncode is not None:
+        return
+    if platform.system() == "Windows":
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/F",
+                "/T",
+                "/PID",
+                str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        await proc.wait()
+    except Exception:
+        pass
 
 
 class CodeRunnerTool(BaseTool):
@@ -44,11 +83,19 @@ class CodeRunnerTool(BaseTool):
             with open(temp_fd, "w", encoding="utf-8") as f:
                 f.write(code)
 
+            exec_kwargs: dict[str, Any] = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+            }
+            if platform.system() == "Windows":
+                exec_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                exec_kwargs["start_new_session"] = True
+
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
                 str(temp_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                **exec_kwargs,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -56,12 +103,7 @@ class CodeRunnerTool(BaseTool):
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError:
-            if proc is not None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
+            await terminate_process_tree(proc)
             return ToolResult(
                 tool_name=self.name,
                 status="error",
@@ -69,6 +111,7 @@ class CodeRunnerTool(BaseTool):
                 output="",
             )
         except Exception as exc:
+            await terminate_process_tree(proc)
             return ToolResult(
                 tool_name=self.name,
                 status="error",
@@ -76,6 +119,7 @@ class CodeRunnerTool(BaseTool):
                 output="",
             )
         finally:
+            await terminate_process_tree(proc)
             if temp_path.exists():
                 try:
                     temp_path.unlink()

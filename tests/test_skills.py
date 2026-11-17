@@ -111,3 +111,47 @@ async def test_skill_generator_creates_skill_file(tmp_path):
     assert created.name == "auto-uv-check"
     assert (skills_dir / "auto-uv-check" / "SKILL.md").exists()
     assert engine.inspect_skill("auto-uv-check") is not None
+
+
+@pytest.mark.asyncio
+async def test_skill_engine_blocks_path_traversal_and_multiline_roundtrip(tmp_path):
+    skills_dir = tmp_path / "skills"
+    engine = SkillEngine(skills_dir=str(skills_dir))
+
+    with pytest.raises(ValueError):
+        engine.save_skill(SkillDefinition(name="..", description="escape", instructions="bad"))
+
+    multiline = SkillDefinition(
+        name="multi-line-skill",
+        description="Line one\nLine two",
+        instructions="# Steps\n1. Run",
+    )
+    engine.save_skill(multiline)
+
+    reloaded = SkillEngine(skills_dir=str(skills_dir))
+    await reloaded.load_skills()
+    loaded = reloaded.inspect_skill("multi-line-skill")
+    assert loaded is not None
+    assert "Line one" in loaded.description
+
+
+@pytest.mark.asyncio
+async def test_read_skill_tool(tmp_path):
+    from aether_agent.skills.tool import ReadSkillTool
+
+    skills_dir = tmp_path / "skills"
+    engine = SkillEngine(skills_dir=str(skills_dir))
+    engine.save_skill(
+        SkillDefinition(
+            name="coding-assistant",
+            description="Coding helper",
+            instructions="Step 1: Read file",
+        )
+    )
+    tool = ReadSkillTool(skill_engine=engine)
+    res = await tool.execute(name="coding-assistant")
+    assert res.status == "success"
+    assert "Step 1: Read file" in res.output
+
+    missing = await tool.execute(name="nonexistent")
+    assert missing.status == "error"

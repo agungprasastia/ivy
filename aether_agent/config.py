@@ -21,11 +21,12 @@ class AetherConfig(BaseModel):
     skills_dir: str = "skills"
     allowed_users: list[str] = Field(default_factory=list)
 
-    # Provider API keys
+    # Provider API keys & endpoint overrides
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     openrouter_api_key: str | None = None
     gemini_api_key: str | None = None
+    api_base: str | None = None
     litellm_api_base: str | None = None
 
     # Gateway tokens
@@ -36,6 +37,9 @@ class AetherConfig(BaseModel):
     auto_approve_safety: bool = False
     verbose: bool = False
     log_level: str = "INFO"
+    max_iterations: int = 15
+    subagent_max_iterations: int = 8
+    code_runner_timeout: float = 30.0
 
     @field_validator("allowed_users", mode="before")
     @classmethod
@@ -52,6 +56,11 @@ class AetherConfig(BaseModel):
         if isinstance(v, str):
             return v.strip().lower() in ("true", "1", "yes", "on")
         return bool(v)
+
+    @property
+    def effective_api_base(self) -> str | None:
+        """Return configured custom API base URL if any."""
+        return self.api_base or self.litellm_api_base
 
 
 def load_config(env_file: str | Path | None = None) -> AetherConfig:
@@ -73,6 +82,7 @@ def load_config(env_file: str | Path | None = None) -> AetherConfig:
         "anthropic_api_key": ["ANTHROPIC_API_KEY"],
         "openrouter_api_key": ["OPENROUTER_API_KEY"],
         "gemini_api_key": ["GEMINI_API_KEY"],
+        "api_base": ["AETHER_API_BASE", "OPENAI_API_BASE", "LITELLM_API_BASE"],
         "litellm_api_base": ["LITELLM_API_BASE"],
         "telegram_token": ["TELEGRAM_TOKEN"],
         "discord_token": ["DISCORD_TOKEN"],

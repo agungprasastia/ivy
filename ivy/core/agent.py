@@ -87,10 +87,17 @@ class IvyAgent:
         if self.memory_store is not None:
             user_profile = await self.memory_store.get_user_profile()
 
+        raw_model = getattr(self.llm_client, "model", None)
+        model_name = raw_model if isinstance(raw_model, str) else None
+        tool_names = [s.get("function", {}).get("name", "") for s in (self.tool_registry.get_schemas() or [])]
         system_prompt = build_system_prompt(
             skill_engine=self.skill_engine,
             user_profile=user_profile,
             extra_instructions=self.extra_system_instructions,
+            model=model_name,
+            platform=platform,
+            session_id=session_id,
+            tool_names=tool_names,
         )
 
         history = await self._load_history(session_id)

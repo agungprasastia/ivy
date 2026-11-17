@@ -257,3 +257,27 @@ def test_system_prompt_includes_working_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     prompt = build_system_prompt()
     assert str(tmp_path) in prompt
+
+
+def test_system_prompt_includes_workspace_snapshot_context_files_and_guidance(tmp_path, monkeypatch):
+    from ivy.core.prompt import build_system_prompt
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text("", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("Always run pytest after edits.", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    prompt = build_system_prompt(
+        model="oc/deepseek-v4.1-flash-free",
+        platform="cli",
+        session_id="cli:main",
+        tool_names=["read_file", "search_files", "terminal"],
+    )
+    assert "Be direct" in prompt
+    assert "Finishing the job" in prompt
+    assert "Parallel tool calls" in prompt
+    assert "Execution discipline" in prompt
+    assert f"Root: {tmp_path}" in prompt
+    assert "uv" in prompt
+    assert "Always run pytest after edits." in prompt
+    assert "Model: oc/deepseek-v4.1-flash-free" in prompt

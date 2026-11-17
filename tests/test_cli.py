@@ -147,3 +147,61 @@ async def test_tui_interactive_handles_turn_error_and_pauses_spinner(tmp_path):
     assert mock_status.start.called
 
     await store.close()
+
+
+def test_tui_banner_and_toolbar_render_tools_skills_and_theme(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+    from ivy.tui.views import render_banner
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=110)
+    render_banner(
+        console,
+        model="gpt-4o-mini",
+        session_id="cli:main",
+        cwd=str(tmp_path),
+        tool_names=["terminal", "read_file", "write_file", "code_runner", "web_search"],
+        skills=[{"name": "coding-assistant", "status": "active", "description": "Code helper"}],
+    )
+    out = buf.getvalue()
+    assert "gpt-4o-mini" in out
+    assert "cli:main" in out
+    assert "Available Tools" in out
+    assert "Available Skills" in out
+    assert "coding-assistant" in out
+    assert "5 tools" in out
+
+
+@pytest.mark.asyncio
+async def test_tui_theme_switch_and_friendly_auth_error(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+    from ivy.tui.app import configure_logging
+
+    configure_logging(verbose=False, log_level="INFO")
+    import logging
+    assert logging.getLogger("httpx2").level >= logging.WARNING
+    assert logging.getLogger("openai").level >= logging.WARNING
+
+    cfg = IvyConfig(db_path=str(tmp_path / "tui4.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=100)
+
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=MagicMock(),
+        console=console,
+    )
+    assert await app.handle_slash_command("/theme hermes") is True
+    assert app.theme.name == "hermes"
+    assert "hermes" in buf.getvalue().lower()
+
+    await store.close()

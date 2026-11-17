@@ -7,6 +7,7 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Sequence
 
+from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 
 from ivy.config import IvyConfig, load_config
@@ -24,15 +25,36 @@ from ivy.tools.registry import ToolRegistry
 from ivy.tools.runner import CodeRunnerTool
 from ivy.tools.terminal import TerminalTool
 from ivy.tools.web import WebFetchTool, WebSearchTool
-from ivy.tui.prompt import create_prompt_session
+from ivy.tui.prompt import build_bottom_toolbar, build_prompt_style, create_prompt_session
+from ivy.tui.theme import ThemeConfig, get_theme, list_themes
 from ivy.tui.views import (
     create_console,
     render_assistant_reply,
     render_banner,
+    render_error,
+    render_help_table,
     render_memory_results,
     render_skills_table,
     render_tool_event,
 )
+
+_NOISY_HTTP_LOGGERS = (
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "openai",
+    "anthropic",
+)
+
+
+def configure_logging(verbose: bool = False, log_level: str = "INFO") -> None:
+    """Configure root logging and silence noisy HTTP SDK logs unless verbose."""
+    level = logging.DEBUG if verbose else getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(level=level)
+    if not verbose:
+        for logger_name in _NOISY_HTTP_LOGGERS:
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", type=str, default=None, help="Override default LLM model")
     parser.add_argument("--session", type=str, default="cli:main", help="Session ID to resume")
+    parser.add_argument("--theme", type=str, default="ivy", help="TUI theme (ivy, hermes, ocean)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -110,6 +133,7 @@ class IvyCLIApp:
         cron_scheduler: CronScheduler | None = None,
         session_id: str = "cli:main",
         console: Console | None = None,
+        theme_name: str = "ivy",
     ) -> None:
         self.config = config
         self.llm_client = llm_client
@@ -120,7 +144,27 @@ class IvyCLIApp:
         self.cron_scheduler = cron_scheduler or CronScheduler()
         self.session_id = session_id
         self.console = console or create_console()
+        self.theme: ThemeConfig = get_theme(theme_name)
         self._active_status: Any = None
+        self._prompt_session: Any = None
+
+    def _tool_names(self) -> list[str]:
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "list_tools"):
+            return []
+        try:
+            return [t.name for t in registry.list_tools()]
+        except Exception:
+            return []
+
+    def _render_toolbar(self) -> HTML:
+        return build_bottom_toolbar(
+            model=self.llm_client.model,
+            session_id=self.session_id,
+            tool_count=len(self._tool_names()),
+            skill_count=len(self.skill_engine.list_skills()),
+            theme=self.theme,
+        )
 
     async def _interactive_approval(self, command: str) -> bool:
         """Pause any active Rich spinner before asking the terminal user for approval."""
@@ -129,7 +173,7 @@ class IvyCLIApp:
             status.stop()
         try:
             self.console.print(
-                f"\n[bold yellow][SAFETY GUARD][/bold yellow] Potentially destructive command:\n  {command}"
+                f"\n[bold {self.theme.ui_warn}][SAFETY GUARD][/] Potentially destructive command:\n  {command}"
             )
             answer = await asyncio.to_thread(
                 lambda: input("Approve execution? [y/N]: ").strip().lower()
@@ -148,48 +192,64 @@ class IvyCLIApp:
         args = parts[1:]
 
         if cmd == "/exit":
-            self.console.print("[dim]Goodbye![/dim]")
+            self.console.print(f"[dim]Goodbye! {self.theme.glyph}[/dim]")
             return False
 
         if cmd == "/help":
-            self.console.print(
-                "/model <name> | /skills list|inspect <name>|remove <name>|reflect | "
-                "/memory <query> | /cron list | /gateway status | /clear | /exit"
-            )
+            render_help_table(self.console, theme=self.theme)
+            return True
+
+        if cmd == "/theme":
+            if not args:
+                names = ", ".join(t.name for t in list_themes())
+                self.console.print(
+                    f"Active theme: [bold {self.theme.ui_accent}]{self.theme.name}[/] (available: {names})"
+                )
+            else:
+                self.theme = get_theme(args[0])
+                if self._prompt_session is not None:
+                    self._prompt_session.style = build_prompt_style(self.theme)
+                self.console.print(
+                    f"Switched theme to: [bold {self.theme.ui_accent}]{self.theme.name}[/] — {self.theme.description}"
+                )
             return True
 
         if cmd == "/model":
             if not args:
-                self.console.print(f"Active model: [green]{self.llm_client.model}[/green]")
+                self.console.print(f"Active model: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             else:
                 self.llm_client.set_model(args[0])
-                self.console.print(f"Switched model to: [green]{self.llm_client.model}[/green]")
+                self.console.print(f"Switched model to: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             return True
 
         if cmd == "/clear":
             await self.memory_store.clear_session(self.session_id)
-            self.console.print(f"Cleared history for session [yellow]{self.session_id}[/yellow].")
+            self.console.print(
+                f"Cleared history for session [{self.theme.ui_label}]{self.session_id}[/]."
+            )
             return True
 
         if cmd == "/memory":
             query = " ".join(args).strip()
             if not query:
-                self.console.print("[yellow]Usage: /memory <search query>[/yellow]")
+                self.console.print(f"[{self.theme.ui_warn}]Usage: /memory <search query>[/]")
             else:
                 hits = await self.memory_store.search_fts(query)
-                render_memory_results(self.console, hits)
+                render_memory_results(self.console, hits, theme=self.theme)
             return True
 
         if cmd == "/skills":
             action = args[0].lower() if args else "list"
             if action == "list":
-                render_skills_table(self.console, self.skill_engine.list_skills())
+                render_skills_table(self.console, self.skill_engine.list_skills(), theme=self.theme)
             elif action == "inspect" and len(args) >= 2:
                 skill = self.skill_engine.inspect_skill(args[1])
                 if skill is None:
-                    self.console.print(f"[red]Skill not found:[/red] {args[1]}")
+                    self.console.print(f"[{self.theme.ui_error}]Skill not found:[/] {args[1]}")
                 else:
-                    self.console.print(f"[bold cyan]{skill.name}[/bold cyan] ({skill.status})")
+                    self.console.print(
+                        f"[bold {self.theme.ui_label}]{skill.name}[/] ({skill.status})"
+                    )
                     self.console.print(skill.instructions)
             elif action == "remove" and len(args) >= 2:
                 removed = self.skill_engine.remove_skill(args[1])
@@ -197,16 +257,18 @@ class IvyCLIApp:
                 self.console.print(msg)
             elif action == "reflect":
                 if self.skill_generator is None:
-                    self.console.print("[yellow]Skill reflection is not configured.[/yellow]")
+                    self.console.print(f"[{self.theme.ui_warn}]Skill reflection is not configured.[/]")
                 else:
                     history = await self.memory_store.get_messages(self.session_id)
                     created = await self.skill_generator.reflect_and_create(history)
                     if created is not None:
-                        self.console.print(f"[green]Created skill:[/green] {created.name}")
+                        self.console.print(f"[{self.theme.ui_ok}]Created skill:[/] {created.name}")
                     else:
                         self.console.print("[dim]No reusable skill extracted from this session.[/dim]")
             else:
-                self.console.print("[yellow]Usage: /skills [list | inspect <name> | remove <name> | reflect][/yellow]")
+                self.console.print(
+                    f"[{self.theme.ui_warn}]Usage: /skills [list | inspect <name> | remove <name> | reflect][/]"
+                )
             return True
 
         if cmd == "/cron":
@@ -224,19 +286,32 @@ class IvyCLIApp:
             self.console.print(f"Gateway tokens — Telegram: {tg_state}, Discord: {dc_state}")
             return True
 
-        self.console.print(f"[yellow]Unknown command:[/yellow] {cmd} (try /help)")
+        self.console.print(f"[{self.theme.ui_warn}]Unknown command:[/] {cmd} (try /help)")
         return True
 
     async def run_interactive(self) -> None:
-        """Start interactive prompt_toolkit REPL."""
-        render_banner(self.console, self.llm_client.model, self.session_id)
-        prompt_session = create_prompt_session()
+        """Start interactive prompt_toolkit REPL with Hermes-inspired chrome."""
+        render_banner(
+            self.console,
+            model=self.llm_client.model,
+            session_id=self.session_id,
+            tool_names=self._tool_names(),
+            skills=self.skill_engine.list_skills(),
+            theme=self.theme,
+        )
+        prompt_session = create_prompt_session(
+            theme=self.theme,
+            bottom_toolbar=self._render_toolbar,
+        )
+        self._prompt_session = prompt_session
 
         while True:
             try:
-                user_input = await prompt_session.prompt_async("\nivy> ")
+                user_input = await prompt_session.prompt_async(
+                    HTML(f"\n<prompt>{self.theme.prompt_symbol} </prompt>")
+                )
             except (EOFError, KeyboardInterrupt):
-                self.console.print("\n[dim]Exiting Ivy.[/dim]")
+                self.console.print(f"\n[dim]Exiting Ivy. {self.theme.glyph}[/dim]")
                 break
 
             text = user_input.strip()
@@ -249,18 +324,23 @@ class IvyCLIApp:
                     break
                 continue
 
-            status = self.console.status("[cyan]Thinking...[/cyan]")
+            status = self.console.status(
+                f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]",
+                spinner="dots",
+            )
             self._active_status = status
             try:
                 with status:
                     reply = await self.agent.run_turn(
                         prompt=text,
                         session_id=self.session_id,
-                        tool_callback=lambda ev: render_tool_event(self.console, ev),
+                        tool_callback=lambda ev: render_tool_event(
+                            self.console, ev, theme=self.theme
+                        ),
                     )
-                render_assistant_reply(self.console, reply.content or "")
+                render_assistant_reply(self.console, reply.content or "", theme=self.theme)
             except Exception as exc:
-                self.console.print(f"[red]Error during turn:[/red] {exc}")
+                render_error(self.console, exc, theme=self.theme)
             finally:
                 self._active_status = None
 
@@ -271,9 +351,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         config.default_model = args.model
     if args.verbose:
         config.verbose = True
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=getattr(logging, config.log_level.upper(), logging.INFO))
+    configure_logging(verbose=config.verbose, log_level=config.log_level)
 
     store = MemoryStore(db_path=config.db_path)
     await store.initialize()
@@ -383,6 +461,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_generator=skill_gen,
             session_id=args.session,
             console=console,
+            theme_name=getattr(args, "theme", "ivy"),
         )
         cli_policy.approval_callback = app._interactive_approval
         if args.command == "cron":

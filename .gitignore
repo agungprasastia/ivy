@@ -36,6 +36,9 @@ venv.bak/
 
 # Databases & local state
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 

@@ -1,10 +1,10 @@
-# Aether Agent
+# Ivy
 
 Autonomous self-improving Python agent inspired by **Hermes Agent**, built cleanly for Python 3.11+ (verified on Python 3.15.2) and managed with Astral `uv`.
 
 ## Overview
 
-Aether Agent is a modular, async-first AI agent ecosystem featuring:
+Ivy is a modular, async-first AI agent ecosystem featuring:
 - **ReAct Autonomous Execution Engine:** Iterative reasoning, tool execution, and error/rejection recovery.
 - **Universal Native LLM Adapter:** Supports OpenAI, Anthropic, Gemini, OpenRouter, Ollama, and vLLM via native `openai` and `anthropic` async SDKs (prebuilt binary wheels with zero C-compiler dependencies).
 - **Multi-Backend Tool Runtime & Safety Guard:** PowerShell/Bash terminal execution, file tools (`read_file`, `write_file`, `list_directory`, `patch_file`, `search_files`), isolated Python `code_runner` with timeout protection, web fetch/search, and destructive command interception (`SafetyApprovalPolicy`).
@@ -43,23 +43,23 @@ Key environment variables:
 
 Run interactive Terminal TUI:
 ```bash
-uv run aether
+uv run ivy
 ```
 
 Override model or resume a specific session:
 ```bash
-uv run aether --model gemini/gemini-2.5-flash --session my-project
+uv run ivy --model gemini/gemini-2.5-flash --session my-project
 ```
 
 Manage skills from CLI:
 ```bash
-uv run aether skills list
-uv run aether skills inspect coding-assistant
+uv run ivy skills list
+uv run ivy skills inspect coding-assistant
 ```
 
 Start the background Gateway & Cron daemon:
 ```bash
-uv run aether gateway start
+uv run ivy gateway start
 ```
 
 ## Testing

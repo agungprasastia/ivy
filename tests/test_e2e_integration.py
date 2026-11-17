@@ -1,23 +1,23 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.config import AetherConfig
-from aether_agent.core.agent import AetherAgent
-from aether_agent.core.types import ChatMessage, Role, ToolCall
-from aether_agent.gateway.server import GatewayServer
-from aether_agent.memory.store import MemoryStore
-from aether_agent.skills.engine import SkillEngine
-from aether_agent.skills.generator import SkillGenerator
-from aether_agent.tools.approval import SafetyApprovalPolicy
-from aether_agent.tools.files import FileTools
-from aether_agent.tools.registry import ToolRegistry
-from aether_agent.tools.runner import CodeRunnerTool
-from aether_agent.tools.terminal import TerminalTool
+from ivy.config import IvyConfig
+from ivy.core.agent import IvyAgent
+from ivy.core.types import ChatMessage, Role, ToolCall
+from ivy.gateway.server import GatewayServer
+from ivy.memory.store import MemoryStore
+from ivy.skills.engine import SkillEngine
+from ivy.skills.generator import SkillGenerator
+from ivy.tools.approval import SafetyApprovalPolicy
+from ivy.tools.files import FileTools
+from ivy.tools.registry import ToolRegistry
+from ivy.tools.runner import CodeRunnerTool
+from ivy.tools.terminal import TerminalTool
 
 
 @pytest.mark.asyncio
 async def test_full_agent_workflow(tmp_path):
-    db_file = str(tmp_path / "aether.db")
+    db_file = str(tmp_path / "ivy.db")
     skills_dir = tmp_path / "skills"
     sample_dir = skills_dir / "coding-assistant"
     sample_dir.mkdir(parents=True)
@@ -26,7 +26,7 @@ async def test_full_agent_workflow(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = AetherConfig(
+    cfg = IvyConfig(
         db_path=db_file,
         skills_dir=str(skills_dir),
         allowed_users=["owner_1"],
@@ -73,7 +73,7 @@ async def test_full_agent_workflow(tmp_path):
         ]
     )
 
-    agent = AetherAgent(
+    agent = IvyAgent(
         llm_client=mock_llm,
         tool_registry=tools,
         memory_store=mem_store,

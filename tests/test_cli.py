@@ -1,14 +1,14 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.config import AetherConfig
-from aether_agent.core.llm import LLMClient
-from aether_agent.core.types import ChatMessage, Role
-from aether_agent.memory.store import MemoryStore
-from aether_agent.skills.engine import SkillEngine
-from aether_agent.skills.format import SkillDefinition
-from aether_agent.tui.app import AetherCLIApp, build_parser
-from aether_agent.tui.prompt import SLASH_COMMANDS, build_slash_completer
+from ivy.config import IvyConfig
+from ivy.core.llm import LLMClient
+from ivy.core.types import ChatMessage, Role
+from ivy.memory.store import MemoryStore
+from ivy.skills.engine import SkillEngine
+from ivy.skills.format import SkillDefinition
+from ivy.tui.app import IvyCLIApp, build_parser
+from ivy.tui.prompt import SLASH_COMMANDS, build_slash_completer
 
 
 def test_cli_parser_subcommands():
@@ -37,7 +37,7 @@ def test_slash_completer_contains_all_commands():
 
 @pytest.mark.asyncio
 async def test_slash_command_dispatch(tmp_path):
-    cfg = AetherConfig(db_path=str(tmp_path / "tui.db"), skills_dir=str(tmp_path / "skills"))
+    cfg = IvyConfig(db_path=str(tmp_path / "tui.db"), skills_dir=str(tmp_path / "skills"))
     store = MemoryStore(db_path=cfg.db_path)
     await store.initialize()
 
@@ -50,7 +50,7 @@ async def test_slash_command_dispatch(tmp_path):
         )
     )
     llm = LLMClient(cfg)
-    app = AetherCLIApp(
+    app = IvyCLIApp(
         config=cfg,
         llm_client=llm,
         memory_store=store,
@@ -74,10 +74,10 @@ async def test_slash_command_dispatch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_tui_tool_registry_has_read_skill_and_reflect_slash_command(tmp_path):
-    from aether_agent.skills.generator import SkillGenerator
-    from aether_agent.tui.app import build_default_tool_registry
+    from ivy.skills.generator import SkillGenerator
+    from ivy.tui.app import build_default_tool_registry
 
-    cfg = AetherConfig(db_path=str(tmp_path / "tui2.db"), skills_dir=str(tmp_path / "skills"))
+    cfg = IvyConfig(db_path=str(tmp_path / "tui2.db"), skills_dir=str(tmp_path / "skills"))
     skills = SkillEngine(skills_dir=cfg.skills_dir)
     registry = build_default_tool_registry(cfg, skill_engine=skills)
     assert registry.get("read_skill") is not None
@@ -90,7 +90,7 @@ async def test_tui_tool_registry_has_read_skill_and_reflect_slash_command(tmp_pa
         return_value=ChatMessage(role=Role.ASSISTANT, content="NO_SKILL")
     )
     gen = SkillGenerator(llm_client=mock_llm, skill_engine=skills)
-    app = AetherCLIApp(
+    app = IvyCLIApp(
         config=cfg,
         llm_client=mock_llm,
         memory_store=store,
@@ -108,7 +108,7 @@ async def test_tui_interactive_handles_turn_error_and_pauses_spinner(tmp_path):
     from io import StringIO
     from rich.console import Console
 
-    cfg = AetherConfig(db_path=str(tmp_path / "tui3.db"), skills_dir=str(tmp_path / "skills"))
+    cfg = IvyConfig(db_path=str(tmp_path / "tui3.db"), skills_dir=str(tmp_path / "skills"))
     store = MemoryStore(db_path=cfg.db_path)
     await store.initialize()
     skills = SkillEngine(skills_dir=cfg.skills_dir)
@@ -119,7 +119,7 @@ async def test_tui_interactive_handles_turn_error_and_pauses_spinner(tmp_path):
 
     buf = StringIO()
     console = Console(file=buf, force_terminal=False)
-    app = AetherCLIApp(
+    app = IvyCLIApp(
         config=cfg,
         llm_client=llm,
         memory_store=store,
@@ -132,7 +132,7 @@ async def test_tui_interactive_handles_turn_error_and_pauses_spinner(tmp_path):
     fake_session = MagicMock()
     fake_session.prompt_async = AsyncMock(side_effect=lambda *a, **k: next(prompts))
 
-    with patch("aether_agent.tui.app.create_prompt_session", return_value=fake_session):
+    with patch("ivy.tui.app.create_prompt_session", return_value=fake_session):
         await app.run_interactive()
 
     assert "LLM API offline" in buf.getvalue()

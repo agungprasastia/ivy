@@ -1,14 +1,14 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.core.agent import AetherAgent
-from aether_agent.core.subagent import SubagentRunner
-from aether_agent.core.types import ChatMessage, Role, ToolCall, ToolResult
-from aether_agent.memory.store import MemoryStore
-from aether_agent.skills.engine import SkillEngine
-from aether_agent.skills.format import SkillDefinition
-from aether_agent.tools.base import BaseTool
-from aether_agent.tools.registry import ToolRegistry
+from ivy.core.agent import IvyAgent
+from ivy.core.subagent import SubagentRunner
+from ivy.core.types import ChatMessage, Role, ToolCall, ToolResult
+from ivy.memory.store import MemoryStore
+from ivy.skills.engine import SkillEngine
+from ivy.skills.format import SkillDefinition
+from ivy.tools.base import BaseTool
+from ivy.tools.registry import ToolRegistry
 
 
 @pytest.mark.asyncio
@@ -37,7 +37,7 @@ async def test_agent_react_turn_execution():
     )
     mock_tools.get_schemas = MagicMock(return_value=[])
 
-    agent = AetherAgent(llm_client=mock_llm, tool_registry=mock_tools)
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=mock_tools)
     response = await agent.run_turn(prompt="Hitung 42", session_id="test-session")
 
     assert "42" in (response.content or "")
@@ -79,7 +79,7 @@ async def test_agent_handles_rejected_tool_without_crashing():
     )
     mock_tools.get_schemas = MagicMock(return_value=[])
 
-    agent = AetherAgent(llm_client=mock_llm, tool_registry=mock_tools)
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=mock_tools)
     response = await agent.run_turn(prompt="Hapus root", session_id="test-reject")
     assert "ditolak" in (response.content or "").lower()
 
@@ -108,13 +108,13 @@ async def test_agent_memory_and_skills_integration(tmp_path):
     mock_llm = MagicMock()
     mock_llm.chat_completion = AsyncMock(side_effect=fake_completion)
 
-    agent = AetherAgent(
+    agent = IvyAgent(
         llm_client=mock_llm,
         tool_registry=ToolRegistry(),
         memory_store=store,
         skill_engine=skills,
     )
-    resp = await agent.run_turn(prompt="Halo Aether", session_id="sess-int")
+    resp = await agent.run_turn(prompt="Halo Ivy", session_id="sess-int")
     assert resp.content == "Siap!"
     system_prompt = captured_messages[0][0].content or ""
     assert "uv-helper" in system_prompt
@@ -174,7 +174,7 @@ async def test_subagent_runner_isolation(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_auto_reflects_after_tool_turn(tmp_path):
-    from aether_agent.skills.generator import SkillGenerator
+    from ivy.skills.generator import SkillGenerator
 
     skills = SkillEngine(skills_dir=str(tmp_path / "skills"))
     mock_llm = MagicMock()
@@ -201,6 +201,6 @@ async def test_agent_auto_reflects_after_tool_turn(tmp_path):
     mock_tools.get_schemas = MagicMock(return_value=[])
 
     gen = SkillGenerator(llm_client=mock_llm, skill_engine=skills)
-    agent = AetherAgent(llm_client=mock_llm, tool_registry=mock_tools, skill_generator=gen)
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=mock_tools, skill_generator=gen)
     await agent.run_turn(prompt="Echo hi", session_id="s-reflect")
     assert skills.inspect_skill("echo-check") is not None

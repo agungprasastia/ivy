@@ -2,10 +2,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.core.types import ChatMessage, Role
-from aether_agent.cron.scheduler import CronScheduler
-from aether_agent.cron.task import ScheduledTask
-from aether_agent.memory.store import MemoryStore
+from ivy.core.types import ChatMessage, Role
+from ivy.cron.scheduler import CronScheduler
+from ivy.cron.task import ScheduledTask
+from ivy.memory.store import MemoryStore
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 [project]
-name = "aether-agent"
+name = "ivy"
 version = "0.1.0"
 description = "Autonomous self-improving Python agent inspired by Hermes Agent"
 readme = "README.md"
@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-aether = "aether_agent.tui.app:main"
+ivy = "ivy.tui.app:main"
 
 [build-system]
 requires = ["hatchling"]

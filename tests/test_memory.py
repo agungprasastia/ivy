@@ -1,8 +1,8 @@
 import pytest
-from aether_agent.core.types import ChatMessage, Role
-from aether_agent.memory.context import ContextWindowManager
-from aether_agent.memory.fts import sanitize_fts_query
-from aether_agent.memory.store import MemoryStore
+from ivy.core.types import ChatMessage, Role
+from ivy.memory.context import ContextWindowManager
+from ivy.memory.fts import sanitize_fts_query
+from ivy.memory.store import MemoryStore
 
 
 @pytest.mark.asyncio

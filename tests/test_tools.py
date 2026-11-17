@@ -2,8 +2,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from aether_agent.tools.approval import SafetyApprovalPolicy
-from aether_agent.tools.files import (
+from ivy.tools.approval import SafetyApprovalPolicy
+from ivy.tools.files import (
     FileTools,
     ListDirectoryTool,
     PatchFileTool,
@@ -11,19 +11,19 @@ from aether_agent.tools.files import (
     SearchFilesTool,
     WriteFileTool,
 )
-from aether_agent.tools.registry import ToolRegistry
-from aether_agent.tools.runner import CodeRunnerTool
-from aether_agent.tools.terminal import TerminalTool
-from aether_agent.tools.web import WebFetchTool, WebSearchTool
+from ivy.tools.registry import ToolRegistry
+from ivy.tools.runner import CodeRunnerTool
+from ivy.tools.terminal import TerminalTool
+from ivy.tools.web import WebFetchTool, WebSearchTool
 
 
 @pytest.mark.asyncio
 async def test_terminal_tool_safe_execution():
     policy = SafetyApprovalPolicy(auto_approve=True)
     term = TerminalTool(approval_policy=policy)
-    res = await term.execute(command='echo "Hello Aether"')
+    res = await term.execute(command='echo "Hello Ivy"')
     assert res.status == "success"
-    assert "Hello Aether" in res.output
+    assert "Hello Ivy" in res.output
 
 
 @pytest.mark.asyncio
@@ -65,13 +65,13 @@ async def test_file_tools(tmp_path: Path):
     patch_res = await patch_tool.execute(
         path=str(target_file),
         target="Hello World",
-        replacement="Hello Aether",
+        replacement="Hello Ivy",
     )
     assert patch_res.status == "success"
 
     # Verify patch
     read_patched = await read_tool.execute(path=str(target_file))
-    assert "Hello Aether" in read_patched.output
+    assert "Hello Ivy" in read_patched.output
 
     # List directory
     list_res = await list_tool.execute(path=str(tmp_path))
@@ -133,13 +133,13 @@ async def test_file_tools_helper_registration(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_search_files_tool(tmp_path: Path):
-    (tmp_path / "alpha.py").write_text("def hello():\n    return 'aether'\n", encoding="utf-8")
+    (tmp_path / "alpha.py").write_text("def hello():\n    return 'ivy'\n", encoding="utf-8")
     sub = tmp_path / "nested"
     sub.mkdir()
     (sub / "beta.txt").write_text("nothing here\n", encoding="utf-8")
 
     search = SearchFilesTool()
-    res = await search.execute(pattern="aether", path=str(tmp_path))
+    res = await search.execute(pattern="ivy", path=str(tmp_path))
     assert res.status == "success"
     assert "alpha.py" in res.output
     assert "beta.txt" not in res.output
@@ -164,7 +164,7 @@ async def test_safety_policy_unattended_and_async_callback():
 async def test_web_tools_extract_and_search(monkeypatch):
     class FakeResponse:
         status_code = 200
-        text = "<html><head><title>Aether</title></head><body><h1>Hello</h1><p>World</p><script>bad()</script></body></html>"
+        text = "<html><head><title>Ivy</title></head><body><h1>Hello</h1><p>World</p><script>bad()</script></body></html>"
 
         def raise_for_status(self):
             return None
@@ -182,7 +182,7 @@ async def test_web_tools_extract_and_search(monkeypatch):
         async def get(self, url, **kwargs):
             return FakeResponse()
 
-    import aether_agent.tools.web as web_mod
+    import ivy.tools.web as web_mod
 
     monkeypatch.setattr(web_mod.httpx, "AsyncClient", FakeClient)
 

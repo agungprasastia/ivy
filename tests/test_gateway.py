@@ -1,13 +1,13 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.config import AetherConfig
-from aether_agent.core.types import ChatMessage, Role
-from aether_agent.gateway.adapters.discord_adapter import DiscordAdapter
-from aether_agent.gateway.adapters.telegram_adapter import TelegramAdapter
-from aether_agent.gateway.server import GatewayServer
-from aether_agent.gateway.session_hub import SessionHub
-from aether_agent.gateway.turn_lease import TurnLeaseManager
+from ivy.config import IvyConfig
+from ivy.core.types import ChatMessage, Role
+from ivy.gateway.adapters.discord_adapter import DiscordAdapter
+from ivy.gateway.adapters.telegram_adapter import TelegramAdapter
+from ivy.gateway.server import GatewayServer
+from ivy.gateway.session_hub import SessionHub
+from ivy.gateway.turn_lease import TurnLeaseManager
 
 
 @pytest.mark.asyncio
@@ -40,7 +40,7 @@ def test_session_hub_cross_platform_routing():
 
 @pytest.mark.asyncio
 async def test_gateway_server_whitelist_enforcement_and_routing():
-    cfg = AetherConfig(allowed_users=["1001"])
+    cfg = IvyConfig(allowed_users=["1001"])
     mock_agent = MagicMock()
     mock_agent.run_turn = AsyncMock(
         return_value=ChatMessage(role=Role.ASSISTANT, content="Approved reply")
@@ -79,8 +79,8 @@ def test_bot_adapters_whitelist_check():
 
 @pytest.mark.asyncio
 async def test_gateway_routes_approval_to_adapter_and_cron_stays_unattended():
-    from aether_agent.gateway.adapters.base import BaseAdapter
-    from aether_agent.tools.approval import SafetyApprovalPolicy
+    from ivy.gateway.adapters.base import BaseAdapter
+    from ivy.tools.approval import SafetyApprovalPolicy
 
     class DummyAdapter(BaseAdapter):
         platform_name = "telegram"
@@ -110,7 +110,7 @@ async def test_gateway_routes_approval_to_adapter_and_cron_stays_unattended():
             approved = await policy.check_approval("rm -rf /tmp/demo")
             return ChatMessage(role=Role.ASSISTANT, content=f"approved={approved}")
 
-    cfg = AetherConfig(allowed_users=["1001"])
+    cfg = IvyConfig(allowed_users=["1001"])
     server = GatewayServer(agent=ApprovalAwareAgent(), config=cfg, approval_policy=policy)
     server.register_adapter(adapter)
 

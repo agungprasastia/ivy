@@ -2,14 +2,14 @@ import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aether_agent.core.types import ChatMessage, Role
-from aether_agent.skills.engine import SkillEngine
-from aether_agent.skills.format import (
+from ivy.core.types import ChatMessage, Role
+from ivy.skills.engine import SkillEngine
+from ivy.skills.format import (
     SkillDefinition,
     parse_skill_markdown,
     serialize_skill_markdown,
 )
-from aether_agent.skills.generator import SkillGenerator
+from ivy.skills.generator import SkillGenerator
 
 
 def test_parse_agentskills_markdown():
@@ -137,7 +137,7 @@ async def test_skill_engine_blocks_path_traversal_and_multiline_roundtrip(tmp_pa
 
 @pytest.mark.asyncio
 async def test_read_skill_tool(tmp_path):
-    from aether_agent.skills.tool import ReadSkillTool
+    from ivy.skills.tool import ReadSkillTool
 
     skills_dir = tmp_path / "skills"
     engine = SkillEngine(skills_dir=str(skills_dir))

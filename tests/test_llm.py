@@ -2,9 +2,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aether_agent.config import AetherConfig
-from aether_agent.core.llm import LLMClient
-from aether_agent.core.types import (
+from ivy.config import IvyConfig
+from ivy.core.llm import LLMClient
+from ivy.core.types import (
     ChatMessage,
     Role,
     SessionState,
@@ -43,7 +43,7 @@ def test_session_state():
 
 
 def test_llm_client_provider_routing():
-    cfg = AetherConfig(
+    cfg = IvyConfig(
         openai_api_key="sk-openai",
         openrouter_api_key="sk-or",
         gemini_api_key="sk-gem",
@@ -76,7 +76,7 @@ def test_llm_client_provider_routing():
 
 @pytest.mark.asyncio
 async def test_llm_client_openai_chat_completion():
-    cfg = AetherConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
     client = LLMClient(cfg)
 
     mock_resp = SimpleNamespace(
@@ -107,7 +107,7 @@ async def test_llm_client_openai_chat_completion():
 
 @pytest.mark.asyncio
 async def test_llm_client_openai_tool_calls():
-    cfg = AetherConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
     client = LLMClient(cfg)
 
     mock_resp = SimpleNamespace(
@@ -148,7 +148,7 @@ async def test_llm_client_openai_tool_calls():
 
 @pytest.mark.asyncio
 async def test_llm_client_anthropic_chat_and_tools():
-    cfg = AetherConfig(default_model="claude-sonnet-4-5", anthropic_api_key="sk-ant")
+    cfg = IvyConfig(default_model="claude-sonnet-4-5", anthropic_api_key="sk-ant")
     client = LLMClient(cfg)
 
     mock_resp = SimpleNamespace(
@@ -194,11 +194,11 @@ async def test_llm_client_anthropic_chat_and_tools():
 
 @pytest.mark.asyncio
 async def test_llm_client_streaming():
-    cfg = AetherConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
     client = LLMClient(cfg)
 
     async def fake_stream():
-        for text in ["Hello", " ", "Aether"]:
+        for text in ["Hello", " ", "Ivy"]:
             yield SimpleNamespace(
                 choices=[SimpleNamespace(delta=SimpleNamespace(content=text))]
             )
@@ -213,11 +213,11 @@ async def test_llm_client_streaming():
             stream=True,
         )
         chunks = [chunk async for chunk in stream]
-        assert "".join(chunks) == "Hello Aether"
+        assert "".join(chunks) == "Hello Ivy"
 
 
 def test_anthropic_coalesces_parallel_tool_results_and_compressed_history():
-    cfg = AetherConfig(default_model="claude-sonnet-4-5", anthropic_api_key="sk-ant")
+    cfg = IvyConfig(default_model="claude-sonnet-4-5", anthropic_api_key="sk-ant")
     client = LLMClient(cfg)
 
     messages = [
@@ -249,7 +249,7 @@ def test_anthropic_coalesces_parallel_tool_results_and_compressed_history():
 
 @pytest.mark.asyncio
 async def test_llm_client_reuses_and_closes_clients():
-    cfg = AetherConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
     client = LLMClient(cfg)
 
     c1 = client._get_openai_client()

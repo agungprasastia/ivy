@@ -230,3 +230,103 @@ def test_footer_style_disables_reverse_and_renders_clean_split():
     assert "gpt-4o-mini" in rendered
     assert "cli:main" in rendered
     assert "/help" in rendered
+
+
+def test_cli_parser_oneshot_prompt():
+    parser = build_parser()
+    args = parser.parse_args(["-p", "cek status git"])
+    assert args.prompt == "cek status git"
+
+
+def test_slash_completer_nested_subcommands(tmp_path):
+    from prompt_toolkit.document import Document
+
+    skills = SkillEngine(skills_dir=str(tmp_path / "skills"))
+    skills.save_skill(
+        SkillDefinition(name="uv-helper", description="UV skill", instructions="Step")
+    )
+    completer = build_slash_completer(skill_engine=skills)
+
+    theme_completions = [
+        c.text for c in completer.get_completions(Document("/theme he"), None)
+    ]
+    assert "hermes" in theme_completions
+
+    skill_completions = [
+        c.text for c in completer.get_completions(Document("/skills inspect uv"), None)
+    ]
+    assert "uv-helper" in skill_completions
+
+
+@pytest.mark.asyncio
+async def test_setup_and_persisted_model_theme_to_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("IVY_API_BASE", raising=False)
+    monkeypatch.delenv("DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("IVY_THEME", raising=False)
+
+    env_file = tmp_path / ".env"
+    cfg = IvyConfig(db_path=str(tmp_path / "tui5.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=MagicMock(),
+        env_path=env_file,
+    )
+    assert await app.handle_slash_command(
+        "/setup http://localhost:20128/v1 sk-9router-xyz openai/gpt-4o"
+    ) is True
+    assert llm.model == "openai/gpt-4o"
+    assert llm.base_url == "http://localhost:20128/v1"
+    assert "sk-9router-xyz" in env_file.read_text(encoding="utf-8")
+
+    assert await app.handle_slash_command("/theme ocean") is True
+    assert "IVY_THEME=ocean" in env_file.read_text(encoding="utf-8")
+
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_cancels_turn_without_exiting_repl(tmp_path):
+    from io import StringIO
+    from unittest.mock import patch
+    from rich.console import Console
+
+    cfg = IvyConfig(db_path=str(tmp_path / "tui6.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+
+    mock_agent = MagicMock()
+    mock_agent.run_turn = AsyncMock(side_effect=KeyboardInterrupt())
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=100)
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        console=console,
+    )
+
+    prompts = iter(["pertanyaan lambat", "/exit"])
+    fake_session = MagicMock()
+    fake_session.prompt_async = AsyncMock(side_effect=lambda *a, **k: next(prompts))
+
+    with patch("ivy.tui.app.create_prompt_session", return_value=fake_session):
+        await app.run_interactive()
+
+    out = buf.getvalue().lower()
+    assert "cancel" in out
+    assert "goodbye" in out
+    await store.close()

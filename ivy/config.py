@@ -37,6 +37,7 @@ class IvyConfig(BaseModel):
     auto_approve_safety: bool = False
     verbose: bool = False
     log_level: str = "INFO"
+    default_theme: str = "ivy"
     max_iterations: int = 15
     subagent_max_iterations: int = 8
     code_runner_timeout: float = 30.0
@@ -89,6 +90,7 @@ def load_config(env_file: str | Path | None = None) -> IvyConfig:
         "auto_approve_safety": ["AUTO_APPROVE_SAFETY"],
         "verbose": ["VERBOSE"],
         "log_level": ["LOG_LEVEL"],
+        "default_theme": ["IVY_THEME"],
     }
 
     for field, env_vars in env_map.items():
@@ -99,3 +101,38 @@ def load_config(env_file: str | Path | None = None) -> IvyConfig:
                 break
 
     return IvyConfig(**data)
+
+
+def update_env_file(
+    updates: dict[str, str], env_path: str | Path = ".env"
+) -> Path:
+    """Persist key-value updates to an env file and refresh os.environ."""
+    target = Path(env_path)
+    lines: list[str] = []
+    if target.exists():
+        lines = target.read_text(encoding="utf-8").splitlines()
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+        key, _ = line.split("=", 1)
+        clean_key = key.strip()
+        if clean_key in remaining:
+            new_lines.append(f"{clean_key}={remaining.pop(clean_key)}")
+        else:
+            new_lines.append(line)
+
+    for key, val in remaining.items():
+        new_lines.append(f"{key}={val}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    for key, val in updates.items():
+        os.environ[key] = val
+
+    return target

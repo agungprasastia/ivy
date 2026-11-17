@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
@@ -41,6 +42,23 @@ class LLMClient:
         self.model = model
         self.provider, self.resolved_model, self.base_url = self._resolve_provider(
             model
+        )
+
+    def reconfigure(
+        self,
+        model: str | None = None,
+        api_base: str | None = None,
+        openai_api_key: str | None = None,
+    ) -> None:
+        """Update endpoint/key/model configuration at runtime."""
+        if api_base is not None:
+            self.config.api_base = api_base or None
+        if openai_api_key is not None:
+            self.config.openai_api_key = openai_api_key or None
+        if model:
+            self.model = model
+        self.provider, self.resolved_model, self.base_url = self._resolve_provider(
+            self.model
         )
 
     def _resolve_provider(self, model: str) -> tuple[str, str, str | None]:
@@ -238,6 +256,150 @@ class LLMClient:
 
         response = await client.chat.completions.create(**params)
         return self._parse_openai_response(response)
+
+    async def stream_turn(
+        self,
+        messages: list[ChatMessage | dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        on_token: Callable[[str], Any | Awaitable[Any]] | None = None,
+        temperature: float | None = None,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        """Stream response tokens via on_token while assembling text and tool calls."""
+        async def _emit(chunk_text: str) -> None:
+            if on_token is None or not chunk_text:
+                return
+            res = on_token(chunk_text)
+            if inspect.isawaitable(res):
+                await res
+
+        if self.provider == "anthropic":
+            system_prompt, formatted, anthropic_tools = self._format_anthropic_payload(
+                messages, tools
+            )
+            params: dict[str, Any] = {
+                "model": self.resolved_model,
+                "messages": formatted,
+                "max_tokens": kwargs.pop("max_tokens", 4096),
+                "stream": True,
+                **kwargs,
+            }
+            if system_prompt:
+                params["system"] = system_prompt
+            if temperature is not None:
+                params["temperature"] = temperature
+            if anthropic_tools:
+                params["tools"] = anthropic_tools
+
+            client = self._get_anthropic_client()
+            resp = await client.messages.create(**params)
+            text_parts: list[str] = []
+            tool_blocks: dict[int, dict[str, Any]] = {}
+            async for event in resp:
+                etype = getattr(event, "type", None)
+                if etype == "content_block_start":
+                    idx = getattr(event, "index", 0)
+                    blk = getattr(event, "content_block", None)
+                    if getattr(blk, "type", None) == "tool_use":
+                        tool_blocks[idx] = {
+                            "id": getattr(blk, "id", ""),
+                            "name": getattr(blk, "name", ""),
+                            "raw_args": "",
+                        }
+                elif etype == "content_block_delta":
+                    idx = getattr(event, "index", 0)
+                    delta = getattr(event, "delta", None)
+                    dtype = getattr(delta, "type", None)
+                    if dtype == "text_delta" or getattr(delta, "text", None):
+                        t = getattr(delta, "text", "") or ""
+                        if t:
+                            text_parts.append(t)
+                            await _emit(t)
+                    elif dtype == "input_json_delta" and idx in tool_blocks:
+                        tool_blocks[idx]["raw_args"] += getattr(delta, "partial_json", "") or ""
+
+            parsed_calls: list[ToolCall] = []
+            for idx in sorted(tool_blocks):
+                tb = tool_blocks[idx]
+                raw_json = tb["raw_args"].strip()
+                try:
+                    args_dict = json.loads(raw_json) if raw_json else {}
+                except Exception:
+                    args_dict = {"raw_input": raw_json}
+                parsed_calls.append(
+                    ToolCall(
+                        id=str(tb["id"]),
+                        function_name=str(tb["name"]),
+                        arguments=args_dict if isinstance(args_dict, dict) else {},
+                    )
+                )
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content="".join(text_parts),
+                tool_calls=parsed_calls or None,
+            )
+
+        formatted_messages = self._format_openai_messages(messages)
+        params = {
+            "model": self.resolved_model,
+            "messages": formatted_messages,
+            "stream": True,
+            **kwargs,
+        }
+        if temperature is not None:
+            params["temperature"] = temperature
+        if tools:
+            params["tools"] = tools
+            params["tool_choice"] = kwargs.get("tool_choice", "auto")
+
+        client = self._get_openai_client()
+        resp = await client.chat.completions.create(**params)
+        text_parts = []
+        tc_acc: dict[int, dict[str, str]] = {}
+
+        async for chunk in resp:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            content_piece = getattr(delta, "content", None)
+            if content_piece:
+                text_parts.append(content_piece)
+                await _emit(content_piece)
+            raw_tcs = getattr(delta, "tool_calls", None)
+            for tc in raw_tcs or []:
+                idx = getattr(tc, "index", 0)
+                entry = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if getattr(tc, "id", None):
+                    entry["id"] = str(tc.id)
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        entry["name"] += str(fn.name)
+                    if getattr(fn, "arguments", None):
+                        entry["arguments"] += str(fn.arguments)
+
+        parsed_calls = []
+        for idx in sorted(tc_acc):
+            item = tc_acc[idx]
+            try:
+                args_dict = json.loads(item["arguments"]) if item["arguments"].strip() else {}
+            except Exception:
+                args_dict = {"raw_input": item["arguments"]}
+            parsed_calls.append(
+                ToolCall(
+                    id=item["id"] or f"call_{idx}",
+                    function_name=item["name"],
+                    arguments=args_dict if isinstance(args_dict, dict) else {},
+                )
+            )
+        return ChatMessage(
+            role=Role.ASSISTANT,
+            content="".join(text_parts),
+            tool_calls=parsed_calls or None,
+        )
 
     async def _stream_openai(
         self, client: AsyncOpenAI, params: dict[str, Any]

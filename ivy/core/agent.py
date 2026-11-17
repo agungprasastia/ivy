@@ -78,6 +78,7 @@ class IvyAgent:
         prompt: str,
         session_id: str = "default",
         platform: str = "cli",
+        stream: bool = False,
         stream_callback: Callable[[str], Any | Awaitable[Any]] | None = None,
         tool_callback: Callable[[dict[str, Any]], Any | Awaitable[Any]] | None = None,
     ) -> ChatMessage:
@@ -110,14 +111,23 @@ class IvyAgent:
         used_tools = False
 
         for _ in range(self.max_iterations):
-            reply = await self.llm_client.chat_completion(
-                messages=messages,
-                tools=schemas,
-                stream=False,
-            )
-            if not isinstance(reply, ChatMessage):
-                text = "".join([chunk async for chunk in reply])
-                reply = ChatMessage(role=Role.ASSISTANT, content=text)
+            did_stream = False
+            if stream and isinstance(self.llm_client, LLMClient):
+                did_stream = True
+                reply = await self.llm_client.stream_turn(
+                    messages=messages,
+                    tools=schemas,
+                    on_token=stream_callback,
+                )
+            else:
+                reply = await self.llm_client.chat_completion(
+                    messages=messages,
+                    tools=schemas,
+                    stream=False,
+                )
+                if not isinstance(reply, ChatMessage):
+                    text = "".join([chunk async for chunk in reply])
+                    reply = ChatMessage(role=Role.ASSISTANT, content=text)
 
             await self._persist_message(session_id, reply, platform=platform)
             messages.append(reply)
@@ -128,7 +138,7 @@ class IvyAgent:
                         await self.skill_generator.reflect_and_create(messages)
                     except Exception:
                         pass
-                if reply.content:
+                if reply.content and not did_stream:
                     await self._emit(stream_callback, reply.content)
                 return reply
 

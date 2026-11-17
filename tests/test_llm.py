@@ -259,3 +259,30 @@ async def test_llm_client_reuses_and_closes_clients():
     with patch.object(c1, "close", new=AsyncMock()) as mock_close:
         await client.close()
         assert mock_close.called
+
+
+@pytest.mark.asyncio
+async def test_llm_client_stream_turn_assembles_text_and_tool_calls():
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    client = LLMClient(cfg)
+
+    async def fake_stream():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello ", tool_calls=None))]
+        )
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="Ivy!", tool_calls=None))]
+        )
+
+    mock_create = AsyncMock(return_value=fake_stream())
+    tokens = []
+    with patch.object(client, "_get_openai_client") as get_client:
+        get_client.return_value = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=mock_create))
+        )
+        msg = await client.stream_turn(
+            messages=[ChatMessage(role=Role.USER, content="Hi")],
+            on_token=tokens.append,
+        )
+        assert msg.content == "Hello Ivy!"
+        assert tokens == ["Hello ", "Ivy!"]

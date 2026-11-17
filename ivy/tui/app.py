@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from prompt_toolkit.formatted_text import FormattedText, HTML
 from rich.console import Console
 
-from ivy.config import IvyConfig, load_config
+from ivy.config import IvyConfig, load_config, update_env_file
 from ivy.core.agent import IvyAgent
 from ivy.core.llm import LLMClient
 from ivy.cron.scheduler import CronScheduler
@@ -63,9 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ivy",
         description="Ivy — Autonomous self-improving Python AI agent",
     )
+    parser.add_argument("-p", "--prompt", type=str, default=None, help="Run a single prompt non-interactively and exit")
     parser.add_argument("--model", type=str, default=None, help="Override default LLM model")
     parser.add_argument("--session", type=str, default="cli:main", help="Session ID to resume")
-    parser.add_argument("--theme", type=str, default="ivy", help="TUI theme (ivy, hermes, ocean)")
+    parser.add_argument("--theme", type=str, default=None, help="TUI theme (ivy, hermes, ocean)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -120,7 +122,7 @@ def build_default_tool_registry(
 
 
 class IvyCLIApp:
-    """Coordinates interactive TUI session and slash command dispatch."""
+    """Coordinates interactive TUI session, streaming, persistence, and slash commands."""
 
     def __init__(
         self,
@@ -133,7 +135,8 @@ class IvyCLIApp:
         cron_scheduler: CronScheduler | None = None,
         session_id: str = "cli:main",
         console: Console | None = None,
-        theme_name: str = "ivy",
+        theme_name: str | None = None,
+        env_path: str | Path | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
@@ -144,7 +147,8 @@ class IvyCLIApp:
         self.cron_scheduler = cron_scheduler or CronScheduler()
         self.session_id = session_id
         self.console = console or create_console()
-        self.theme: ThemeConfig = get_theme(theme_name)
+        self.theme: ThemeConfig = get_theme(theme_name or config.default_theme)
+        self.env_path = env_path
         self._active_status: Any = None
         self._prompt_session: Any = None
 
@@ -166,6 +170,10 @@ class IvyCLIApp:
             theme=self.theme,
         )
 
+    def _persist_env(self, updates: dict[str, str]) -> None:
+        if self.env_path is not None:
+            update_env_file(updates, env_path=self.env_path)
+
     async def _interactive_approval(self, command: str) -> bool:
         """Pause any active Rich spinner before asking the terminal user for approval."""
         status = self._active_status
@@ -185,6 +193,45 @@ class IvyCLIApp:
             if status is not None:
                 status.start()
 
+    async def _handle_setup(self, args: list[str]) -> None:
+        """Configure API base URL, API key, and default model, persisting to .env."""
+        if len(args) >= 2:
+            api_base = args[0].strip()
+            api_key = args[1].strip()
+            model = args[2].strip() if len(args) >= 3 else self.llm_client.model
+        else:
+            default_base = self.config.effective_api_base or "http://localhost:20128/v1"
+            self.console.print(
+                f"[bold {self.theme.ui_accent}]{self.theme.glyph} Ivy Endpoint Setup[/] "
+                "[dim](press Enter to keep current value)[/dim]"
+            )
+            api_base = await asyncio.to_thread(
+                lambda: input(f"  API Base URL [{default_base}]: ").strip() or default_base
+            )
+            api_key = await asyncio.to_thread(
+                lambda: input("  API Key: ").strip()
+            )
+            model = await asyncio.to_thread(
+                lambda: input(f"  Default Model [{self.llm_client.model}]: ").strip() or self.llm_client.model
+            )
+
+        updates: dict[str, str] = {"DEFAULT_MODEL": model}
+        if api_base:
+            updates["IVY_API_BASE"] = api_base
+        if api_key:
+            updates["OPENAI_API_KEY"] = api_key
+
+        self.llm_client.reconfigure(
+            model=model,
+            api_base=api_base or None,
+            openai_api_key=api_key or None,
+        )
+        self._persist_env(updates)
+        self.console.print(
+            f"[{self.theme.ui_ok}]Saved endpoint configuration[/] "
+            f"(model=[bold]{self.llm_client.model}[/bold], base=[dim]{self.llm_client.base_url or 'default'}[/dim])"
+        )
+
     async def handle_slash_command(self, raw_line: str) -> bool:
         """Handle a slash command. Returns False to exit interactive loop."""
         parts = raw_line.strip().split()
@@ -199,6 +246,10 @@ class IvyCLIApp:
             render_help_table(self.console, theme=self.theme)
             return True
 
+        if cmd == "/setup":
+            await self._handle_setup(args)
+            return True
+
         if cmd == "/theme":
             if not args:
                 names = ", ".join(t.name for t in list_themes())
@@ -207,6 +258,7 @@ class IvyCLIApp:
                 )
             else:
                 self.theme = get_theme(args[0])
+                self._persist_env({"IVY_THEME": self.theme.name})
                 if self._prompt_session is not None:
                     self._prompt_session.style = build_prompt_style(self.theme)
                 self.console.print(
@@ -219,6 +271,7 @@ class IvyCLIApp:
                 self.console.print(f"Active model: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             else:
                 self.llm_client.set_model(args[0])
+                self._persist_env({"DEFAULT_MODEL": self.llm_client.model})
                 self.console.print(f"Switched model to: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             return True
 
@@ -289,6 +342,61 @@ class IvyCLIApp:
         self.console.print(f"[{self.theme.ui_warn}]Unknown command:[/] {cmd} (try /help)")
         return True
 
+    async def _run_turn_with_live_stream(self, prompt_text: str) -> None:
+        """Execute one turn with spinner, live token streaming, and Ctrl+C cancellation."""
+        status = self.console.status(
+            f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]",
+            spinner="dots",
+        )
+        self._active_status = status
+        stream_started = False
+        rule = f"[{self.theme.ui_accent}]{'─' * 44}[/]"
+
+        def _on_token(chunk: str) -> None:
+            nonlocal stream_started
+            if not stream_started:
+                stream_started = True
+                status.stop()
+                self.console.print()
+                self.console.print(rule)
+                self.console.print(f"[bold {self.theme.ui_accent}]{self.theme.glyph} Ivy[/]")
+            self.console.file.write(chunk)
+            self.console.file.flush()
+
+        def _on_tool(ev: dict[str, Any]) -> None:
+            nonlocal stream_started
+            if stream_started:
+                self.console.file.write("\n")
+                self.console.file.flush()
+                stream_started = False
+                status.start()
+            render_tool_event(self.console, ev, theme=self.theme)
+
+        try:
+            with status:
+                reply = await self.agent.run_turn(
+                    prompt=prompt_text,
+                    session_id=self.session_id,
+                    stream=True,
+                    stream_callback=_on_token,
+                    tool_callback=_on_tool,
+                )
+            if stream_started:
+                self.console.file.write("\n")
+                self.console.file.flush()
+                self.console.print(rule)
+            else:
+                render_assistant_reply(self.console, reply.content or "", theme=self.theme)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if stream_started:
+                self.console.file.write("\n")
+                self.console.file.flush()
+            self.console.print(f"[{self.theme.ui_warn}]Turn cancelled.[/]")
+        except Exception as exc:
+            render_error(self.console, exc, theme=self.theme)
+        finally:
+            self._active_status = None
+
     async def run_interactive(self) -> None:
         """Start interactive prompt_toolkit REPL with Hermes-inspired chrome."""
         render_banner(
@@ -302,6 +410,7 @@ class IvyCLIApp:
         prompt_session = create_prompt_session(
             theme=self.theme,
             bottom_toolbar=self._render_toolbar,
+            skill_engine=self.skill_engine,
         )
         self._prompt_session = prompt_session
 
@@ -324,25 +433,7 @@ class IvyCLIApp:
                     break
                 continue
 
-            status = self.console.status(
-                f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]",
-                spinner="dots",
-            )
-            self._active_status = status
-            try:
-                with status:
-                    reply = await self.agent.run_turn(
-                        prompt=text,
-                        session_id=self.session_id,
-                        tool_callback=lambda ev: render_tool_event(
-                            self.console, ev, theme=self.theme
-                        ),
-                    )
-                render_assistant_reply(self.console, reply.content or "", theme=self.theme)
-            except Exception as exc:
-                render_error(self.console, exc, theme=self.theme)
-            finally:
-                self._active_status = None
+            await self._run_turn_with_live_stream(text)
 
 
 async def _run_async(args: argparse.Namespace) -> int:
@@ -461,11 +552,16 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_generator=skill_gen,
             session_id=args.session,
             console=console,
-            theme_name=getattr(args, "theme", "ivy"),
+            theme_name=args.theme or config.default_theme,
+            env_path=".env",
         )
         cli_policy.approval_callback = app._interactive_approval
         if args.command == "cron":
             await app.handle_slash_command("/cron list")
+            return 0
+
+        if args.prompt:
+            await app._run_turn_with_live_stream(args.prompt)
             return 0
 
         await app.run_interactive()

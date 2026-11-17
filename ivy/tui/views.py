@@ -196,7 +196,8 @@ def render_help_table(
     table.add_column("Command", style=f"bold {t.ui_label}")
     table.add_column("Description")
     rows = [
-        ("/model [name]", "Show active model or switch provider/model"),
+        ("/setup [base] [key] [model]", "Configure API endpoint/key & save to .env"),
+        ("/model [name]", "Show active model or switch & save to .env"),
         ("/skills list", "List all discovered skills"),
         ("/skills inspect <name>", "Inspect instructions of a skill"),
         ("/skills remove <name>", "Delete a skill"),
@@ -204,7 +205,7 @@ def render_help_table(
         ("/memory <query>", "Search conversation history via SQLite FTS5"),
         ("/cron list", "Show scheduled background cron jobs"),
         ("/gateway status", "Show Telegram/Discord gateway configuration"),
-        ("/theme [name]", "Switch TUI theme (ivy, hermes, ocean)"),
+        ("/theme [name]", "Switch & save TUI theme (ivy, hermes, ocean)"),
         ("/clear", "Clear current session message history"),
         ("/exit", "Exit Ivy"),
     ]

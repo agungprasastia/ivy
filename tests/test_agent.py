@@ -204,3 +204,28 @@ async def test_agent_auto_reflects_after_tool_turn(tmp_path):
     agent = IvyAgent(llm_client=mock_llm, tool_registry=mock_tools, skill_generator=gen)
     await agent.run_turn(prompt="Echo hi", session_id="s-reflect")
     assert skills.inspect_skill("echo-check") is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_run_turn_streams_tokens_when_stream_enabled():
+    from ivy.config import IvyConfig
+    from ivy.core.llm import LLMClient
+
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    llm = LLMClient(cfg)
+    llm.stream_turn = AsyncMock(
+        side_effect=lambda **kw: (
+            kw["on_token"]("Hai ") or kw["on_token"]("dunia!")
+            or ChatMessage(role=Role.ASSISTANT, content="Hai dunia!")
+        )
+    )
+    agent = IvyAgent(llm_client=llm, tool_registry=ToolRegistry())
+    chunks = []
+    reply = await agent.run_turn(
+        prompt="Halo",
+        session_id="stream-1",
+        stream=True,
+        stream_callback=chunks.append,
+    )
+    assert reply.content == "Hai dunia!"
+    assert "".join(chunks) == "Hai dunia!"

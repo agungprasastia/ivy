@@ -53,3 +53,29 @@ def test_isolated_subpackage_imports():
             check=False,
         )
         assert proc.returncode == 0, f"Failed importing {pkg}: {proc.stderr}"
+
+
+def test_update_env_file_persists_keys_and_theme(tmp_path, monkeypatch):
+    from ivy.config import update_env_file
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("# Ivy config\nOPENAI_API_KEY=\nDEFAULT_MODEL=gpt-4o-mini\n", encoding="utf-8")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("IVY_API_BASE", raising=False)
+    monkeypatch.delenv("IVY_THEME", raising=False)
+
+    update_env_file(
+        {
+            "OPENAI_API_KEY": "sk-9router-123",
+            "IVY_API_BASE": "http://localhost:20128/v1",
+            "DEFAULT_MODEL": "openai/claude-sonnet-4-5",
+            "IVY_THEME": "hermes",
+        },
+        env_path=env_file,
+    )
+
+    loaded = load_config(env_file=env_file)
+    assert loaded.openai_api_key == "sk-9router-123"
+    assert loaded.effective_api_base == "http://localhost:20128/v1"
+    assert loaded.default_model == "openai/claude-sonnet-4-5"
+    assert loaded.default_theme == "hermes"

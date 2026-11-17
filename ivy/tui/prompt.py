@@ -1,19 +1,24 @@
-"""Prompt-toolkit input configuration, bottom status bar, and slash autocomplete."""
+"""Prompt-toolkit input configuration, bottom status bar, and nested slash autocomplete."""
 
 from __future__ import annotations
 
 import shutil
-from typing import Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 
-from ivy.tui.theme import ThemeConfig, get_theme
+from ivy.tui.theme import ThemeConfig, get_theme, list_themes
+
+if TYPE_CHECKING:
+    from ivy.skills.engine import SkillEngine
 
 SLASH_COMMANDS = [
+    "/setup",
     "/model",
     "/skills",
     "/gateway",
@@ -26,7 +31,8 @@ SLASH_COMMANDS = [
 ]
 
 SLASH_COMMAND_META: dict[str, str] = {
-    "/model": "Switch or inspect active LLM model",
+    "/setup": "Configure API base URL, API key, and default model (.env)",
+    "/model": "Switch or inspect active LLM model (persisted to .env)",
     "/skills": "List, inspect, remove, or reflect skills",
     "/gateway": "Show Telegram/Discord gateway status",
     "/cron": "List scheduled cron tasks",
@@ -37,15 +43,101 @@ SLASH_COMMAND_META: dict[str, str] = {
     "/exit": "Exit Ivy",
 }
 
+_SUBCOMMAND_META: dict[str, dict[str, str]] = {
+    "/skills": {
+        "list": "List all loaded skills",
+        "inspect": "Inspect a skill's instructions",
+        "remove": "Delete a skill",
+        "reflect": "Synthesize a skill from current session",
+    },
+    "/gateway": {
+        "start": "Start Telegram/Discord daemon",
+        "status": "Show gateway configuration status",
+    },
+    "/cron": {
+        "list": "List scheduled cron tasks",
+    },
+}
 
-def build_slash_completer() -> WordCompleter:
-    """Create autocomplete completer with descriptions for slash commands."""
-    return WordCompleter(
-        SLASH_COMMANDS,
-        ignore_case=True,
-        sentence=True,
-        meta_dict=SLASH_COMMAND_META,
-    )
+
+class SlashCompleter(Completer):
+    """Context-aware nested completer for Ivy slash commands and sub-arguments."""
+
+    def __init__(self, skill_engine: SkillEngine | None = None) -> None:
+        self.words = list(SLASH_COMMANDS)
+        self.skill_engine = skill_engine
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
+        text = document.text_before_cursor.lstrip()
+        if not text.startswith("/"):
+            return
+
+        ends_with_space = document.text_before_cursor.endswith(" ")
+        tokens = text.split()
+
+        # Level 1: top-level `/command`
+        if len(tokens) == 1 and not ends_with_space:
+            prefix = tokens[0].lower()
+            for cmd in self.words:
+                if cmd.startswith(prefix):
+                    yield Completion(
+                        cmd,
+                        start_position=-len(tokens[0]),
+                        display_meta=SLASH_COMMAND_META.get(cmd, ""),
+                    )
+            return
+
+        cmd = tokens[0].lower()
+        partial = "" if ends_with_space else tokens[-1]
+        arg_pos = 1 if ends_with_space else len(tokens) - 1
+
+        # Level 2: `/theme <name>`
+        if cmd == "/theme" and arg_pos == 1:
+            for th in list_themes():
+                if th.name.startswith(partial.lower()):
+                    yield Completion(
+                        th.name,
+                        start_position=-len(partial),
+                        display_meta=th.description,
+                    )
+            return
+
+        # Level 2: `/skills|gateway|cron <subcommand>`
+        if cmd in _SUBCOMMAND_META and arg_pos == 1:
+            for sub, meta in _SUBCOMMAND_META[cmd].items():
+                if sub.startswith(partial.lower()):
+                    yield Completion(
+                        sub,
+                        start_position=-len(partial),
+                        display_meta=meta,
+                    )
+            return
+
+        # Level 3: `/skills inspect|remove <skill-name>`
+        if (
+            cmd == "/skills"
+            and len(tokens) >= 2
+            and tokens[1].lower() in ("inspect", "remove")
+            and arg_pos == 2
+            and self.skill_engine is not None
+        ):
+            for skill in self.skill_engine.list_skills():
+                name = skill["name"]
+                if name.lower().startswith(partial.lower()):
+                    yield Completion(
+                        name,
+                        start_position=-len(partial),
+                        display_meta=skill.get("description", ""),
+                    )
+
+
+def build_slash_completer(
+    skill_engine: SkillEngine | None = None,
+) -> SlashCompleter:
+    """Create nested autocomplete completer for slash commands."""
+    return SlashCompleter(skill_engine=skill_engine)
 
 
 def build_prompt_style(theme: ThemeConfig | None = None) -> Style:
@@ -94,12 +186,12 @@ def build_bottom_toolbar(
     ]
 
     right_parts: list[tuple[str, str]] = [
+        ("class:bottom-toolbar.strong", "/setup"),
+        ("class:bottom-toolbar.dim", " key · "),
         ("class:bottom-toolbar.strong", "/help"),
-        ("class:bottom-toolbar.dim", " commands · "),
-        ("class:bottom-toolbar.strong", "/theme"),
-        ("class:bottom-toolbar.dim", " skin · "),
-        ("class:bottom-toolbar.strong", "Ctrl+D"),
-        ("class:bottom-toolbar.dim", " exit "),
+        ("class:bottom-toolbar.dim", " cmds · "),
+        ("class:bottom-toolbar.strong", "Ctrl+C"),
+        ("class:bottom-toolbar.dim", " cancel "),
     ]
 
     left_len = sum(len(txt) for _, txt in left_parts)
@@ -123,11 +215,12 @@ def build_bottom_toolbar(
 def create_prompt_session(
     theme: ThemeConfig | None = None,
     bottom_toolbar: Callable[[], FormattedText] | None = None,
+    skill_engine: SkillEngine | None = None,
 ) -> PromptSession[str]:
     """Create an interactive prompt_toolkit session with themed chrome and completion."""
     return PromptSession(
         history=InMemoryHistory(),
-        completer=build_slash_completer(),
+        completer=build_slash_completer(skill_engine=skill_engine),
         complete_while_typing=True,
         style=build_prompt_style(theme),
         bottom_toolbar=bottom_toolbar,

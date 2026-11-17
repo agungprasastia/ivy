@@ -281,3 +281,11 @@ def test_system_prompt_includes_workspace_snapshot_context_files_and_guidance(tm
     assert "uv" in prompt
     assert "Always run pytest after edits." in prompt
     assert "Model: oc/deepseek-v4.1-flash-free" in prompt
+
+
+def test_system_prompt_marks_workspace_authoritative_over_upstream_proxies():
+    from ivy.core.prompt import build_system_prompt
+
+    prompt = build_system_prompt(model="oc/deepseek-v4.1-flash-free")
+    assert "Authoritative" in prompt or "authoritative" in prompt
+    assert "router" in prompt.lower() or "proxy" in prompt.lower()

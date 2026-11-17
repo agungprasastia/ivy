@@ -1,4 +1,4 @@
-"""Hermes-inspired modular system prompt builder, workspace probe, and formatters."""
+"""System prompt builder, workspace probe, and formatters."""
 
 from __future__ import annotations
 

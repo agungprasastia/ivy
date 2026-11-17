@@ -229,3 +229,31 @@ async def test_agent_run_turn_streams_tokens_when_stream_enabled():
     )
     assert reply.content == "Hai dunia!"
     assert "".join(chunks) == "Hai dunia!"
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_persist_user_message_on_llm_error(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "err.db"))
+    await store.initialize()
+
+    mock_llm = MagicMock()
+    mock_llm.chat_completion = AsyncMock(side_effect=RuntimeError("401 Unauthorized"))
+
+    agent = IvyAgent(
+        llm_client=mock_llm,
+        tool_registry=ToolRegistry(),
+        memory_store=store,
+    )
+    with pytest.raises(RuntimeError):
+        await agent.run_turn(prompt="halo", session_id="err-sess")
+
+    assert await store.get_messages("err-sess") == []
+    await store.close()
+
+
+def test_system_prompt_includes_working_directory(tmp_path, monkeypatch):
+    from ivy.core.prompt import build_system_prompt
+
+    monkeypatch.chdir(tmp_path)
+    prompt = build_system_prompt()
+    assert str(tmp_path) in prompt

@@ -330,3 +330,40 @@ async def test_ctrl_c_cancels_turn_without_exiting_repl(tmp_path):
     assert "cancel" in out
     assert "goodbye" in out
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_stream_renders_rich_markdown_not_raw_asterisks(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+
+    cfg = IvyConfig(db_path=str(tmp_path / "md.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+
+    async def fake_stream_turn(prompt, session_id="default", stream=False, stream_callback=None, tool_callback=None, **kwargs):
+        for piece in ["Halo! ", "**Inspeksi kode** ", "`ivy`"]:
+            if stream_callback:
+                stream_callback(piece)
+        return ChatMessage(role=Role.ASSISTANT, content="Halo! **Inspeksi kode** `ivy`")
+
+    mock_agent = MagicMock()
+    mock_agent.run_turn = AsyncMock(side_effect=fake_stream_turn)
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=100)
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        console=console,
+    )
+    await app._run_turn_with_live_stream("halo")
+    rendered = buf.getvalue()
+    assert "Inspeksi kode" in rendered
+    assert "**Inspeksi kode**" not in rendered
+    await store.close()

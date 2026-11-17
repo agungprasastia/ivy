@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
 
 BASE_SYSTEM_PROMPT = """You are Ivy, an autonomous, helpful, and safety-conscious AI software engineering and productivity assistant.
 You operate in a ReAct loop: analyze the request, invoke tools when needed, inspect results carefully, and synthesize a clear final answer.
+Always ground file paths and project facts in the actual Working Directory and observed tool outputs; never guess external directories.
 If a tool execution is rejected by the safety guard or returns an error, reflect on the reason and propose a safe alternative instead of retrying the exact blocked command."""
 
 
@@ -23,7 +25,7 @@ def build_system_prompt(
     """Build dynamic system prompt including environment, user profile, and active skills."""
     sections = [
         BASE_SYSTEM_PROMPT,
-        f"Runtime Environment: OS={platform.system()} ({platform.release()})",
+        f"Runtime Environment: OS={platform.system()} ({platform.release()})\nWorking Directory: {os.getcwd()}",
     ]
 
     if user_profile:

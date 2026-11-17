@@ -112,8 +112,9 @@ def render_banner(
         padding=(0, 2),
     )
 
+    term_size = shutil.get_terminal_size((100, 30))
     console.print()
-    if shutil.get_terminal_size((100, 24)).columns >= 75:
+    if term_size.columns >= 75 and term_size.lines >= 28:
         console.print(IVY_ASCII_LOGO.format(**palette))
         console.print()
     console.print(outer)

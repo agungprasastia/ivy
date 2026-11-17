@@ -95,7 +95,6 @@ class IvyAgent:
 
         history = await self._load_history(session_id)
         user_msg = ChatMessage(role=Role.USER, content=prompt)
-        await self._persist_message(session_id, user_msg, platform=platform)
 
         messages: list[ChatMessage] = [
             ChatMessage(role=Role.SYSTEM, content=system_prompt),
@@ -109,6 +108,7 @@ class IvyAgent:
 
         schemas = self.tool_registry.get_schemas() or None
         used_tools = False
+        user_persisted = False
 
         for _ in range(self.max_iterations):
             did_stream = False
@@ -129,6 +129,9 @@ class IvyAgent:
                     text = "".join([chunk async for chunk in reply])
                     reply = ChatMessage(role=Role.ASSISTANT, content=text)
 
+            if not user_persisted:
+                await self._persist_message(session_id, user_msg, platform=platform)
+                user_persisted = True
             await self._persist_message(session_id, reply, platform=platform)
             messages.append(reply)
 

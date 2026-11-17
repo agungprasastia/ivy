@@ -10,6 +10,8 @@ from typing import Any, Awaitable, Callable, Sequence
 
 from prompt_toolkit.formatted_text import FormattedText, HTML
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 
 from ivy.config import IvyConfig, load_config, update_env_file
 from ivy.core.agent import IvyAgent
@@ -343,32 +345,44 @@ class IvyCLIApp:
         return True
 
     async def _run_turn_with_live_stream(self, prompt_text: str) -> None:
-        """Execute one turn with spinner, live token streaming, and Ctrl+C cancellation."""
+        """Execute one turn with spinner, live Rich Markdown streaming, and Ctrl+C cancel."""
         status = self.console.status(
             f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]",
             spinner="dots",
         )
         self._active_status = status
-        stream_started = False
+        live: Live | None = None
+        chunks: list[str] = []
         rule = f"[{self.theme.ui_accent}]{'─' * 44}[/]"
 
+        def _stop_live() -> None:
+            nonlocal live
+            if live is not None:
+                live.stop()
+                live = None
+
         def _on_token(chunk: str) -> None:
-            nonlocal stream_started
-            if not stream_started:
-                stream_started = True
+            nonlocal live
+            chunks.append(chunk)
+            if live is None:
                 status.stop()
                 self.console.print()
                 self.console.print(rule)
                 self.console.print(f"[bold {self.theme.ui_accent}]{self.theme.glyph} Ivy[/]")
-            self.console.file.write(chunk)
-            self.console.file.flush()
+                live = Live(
+                    Markdown("".join(chunks)),
+                    console=self.console,
+                    refresh_per_second=12,
+                    vertical_overflow="visible",
+                )
+                live.start()
+            else:
+                live.update(Markdown("".join(chunks)))
 
         def _on_tool(ev: dict[str, Any]) -> None:
-            nonlocal stream_started
-            if stream_started:
-                self.console.file.write("\n")
-                self.console.file.flush()
-                stream_started = False
+            if live is not None:
+                _stop_live()
+                chunks.clear()
                 status.start()
             render_tool_event(self.console, ev, theme=self.theme)
 
@@ -381,20 +395,20 @@ class IvyCLIApp:
                     stream_callback=_on_token,
                     tool_callback=_on_tool,
                 )
-            if stream_started:
-                self.console.file.write("\n")
-                self.console.file.flush()
+            if live is not None:
+                live.update(Markdown(reply.content or "".join(chunks)))
+                _stop_live()
                 self.console.print(rule)
             else:
                 render_assistant_reply(self.console, reply.content or "", theme=self.theme)
         except (asyncio.CancelledError, KeyboardInterrupt):
-            if stream_started:
-                self.console.file.write("\n")
-                self.console.file.flush()
+            _stop_live()
             self.console.print(f"[{self.theme.ui_warn}]Turn cancelled.[/]")
         except Exception as exc:
+            _stop_live()
             render_error(self.console, exc, theme=self.theme)
         finally:
+            _stop_live()
             self._active_status = None
 
     async def run_interactive(self) -> None:

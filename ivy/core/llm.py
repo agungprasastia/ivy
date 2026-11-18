@@ -30,8 +30,35 @@ _RETRYABLE_CLASS_NAMES = {
 }
 
 
+_QUOTA_ERROR_MARKERS = (
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_hard_limit",
+    "exceeded your current quota",
+)
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Detect non-retryable account quota / billing exhaustion errors returned on HTTP 429."""
+    code = getattr(exc, "code", None)
+    etype = getattr(exc, "type", None)
+    body = getattr(exc, "body", None)
+    err_obj = body.get("error") if isinstance(body, dict) else None
+    candidates = [
+        str(code or ""),
+        str(etype or ""),
+        str((err_obj or {}).get("code", "")) if isinstance(err_obj, dict) else "",
+        str((err_obj or {}).get("type", "")) if isinstance(err_obj, dict) else "",
+        str(exc),
+    ]
+    joined = " ".join(candidates).lower()
+    return any(marker in joined for marker in _QUOTA_ERROR_MARKERS)
+
+
 def _is_retryable_error(exc: Exception) -> bool:
     """True when an LLM SDK exception represents a transient rate-limit, timeout, or 5xx error."""
+    if _is_quota_error(exc):
+        return False
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(exc, "status", None)
@@ -164,7 +191,7 @@ class LLMClient:
         cache_key = (api_key, active_base)
         client = self._openai_clients.get(cache_key)
         if client is None:
-            kwargs: dict[str, Any] = {"api_key": api_key}
+            kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": 0}
             if active_base:
                 kwargs["base_url"] = active_base
             client = AsyncOpenAI(**kwargs)
@@ -177,7 +204,7 @@ class LLMClient:
         cache_key = (api_key, active_base)
         client = self._anthropic_clients.get(cache_key)
         if client is None:
-            kwargs: dict[str, Any] = {"api_key": api_key}
+            kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": 0}
             if active_base:
                 kwargs["base_url"] = active_base
             client = AsyncAnthropic(**kwargs)

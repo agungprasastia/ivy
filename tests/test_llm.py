@@ -515,3 +515,37 @@ async def test_llm_client_fallback_does_not_mutate_shared_model_under_concurrenc
     assert reply_b.content == "Primary OK"
     assert seen_openai_models == ["gpt-4o-mini", "gpt-4o-mini"]
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_does_not_retry_quota_429_and_disables_sdk_retries(monkeypatch):
+    class QuotaErr(Exception):
+        status_code = 429
+        code = "insufficient_quota"
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", sleep_mock)
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        anthropic_api_key="test-ant",
+        default_model="gpt-4o-mini",
+        fallback_model="anthropic/claude-sonnet-4-5",
+        llm_max_retries=2,
+    )
+    client = LLMClient(config=cfg)
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(side_effect=QuotaErr("quota exceeded"))
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+
+    with pytest.raises(QuotaErr):
+        await client.chat_completion([ChatMessage(role=Role.USER, content="hi")])
+    assert mock_openai.chat.completions.create.await_count == 1
+    assert sleep_mock.await_count == 0
+    await client.close()
+
+    with patch("ivy.core.llm.AsyncOpenAI") as oa_cls, patch("ivy.core.llm.AsyncAnthropic") as an_cls:
+        c2 = LLMClient(config=cfg)
+        c2._get_openai_client()
+        c2._get_anthropic_client()
+        assert oa_cls.call_args.kwargs.get("max_retries") == 0
+        assert an_cls.call_args.kwargs.get("max_retries") == 0

@@ -200,6 +200,12 @@ class IvyAgent:
         used_tools = False
         user_persisted = False
         turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "api_calls": 0}
+        comp_usage = auto_compacted.get("compaction_usage") if isinstance(auto_compacted, dict) else None
+        if isinstance(comp_usage, dict):
+            turn_usage["api_calls"] += int(comp_usage.get("api_calls", 0) or 0)
+            turn_usage["prompt_tokens"] += int(comp_usage.get("prompt_tokens", 0) or 0)
+            turn_usage["completion_tokens"] += int(comp_usage.get("completion_tokens", 0) or 0)
+            turn_usage["total_tokens"] += int(comp_usage.get("total_tokens", 0) or 0)
         tool_calls_count = 0
 
         for _ in range(self.max_iterations):
@@ -312,6 +318,8 @@ class IvyAgent:
                     summary_reply.metadata["turn_usage"] = turn_usage
                     summary_reply.metadata["tool_calls_count"] = tool_calls_count
                     summary_reply.metadata["context_messages"] = len(messages)
+                    if auto_compacted is not None:
+                        summary_reply.metadata["auto_compacted"] = auto_compacted
                     await self._persist_message(session_id, summary_reply, platform=platform)
                     if not did_stream:
                         await self._emit(stream_callback, summary_reply.content)
@@ -319,14 +327,17 @@ class IvyAgent:
             except Exception:
                 pass
 
+        exhausted_meta: dict[str, Any] = {
+            "turn_usage": turn_usage,
+            "tool_calls_count": tool_calls_count,
+            "context_messages": len(messages),
+        }
+        if auto_compacted is not None:
+            exhausted_meta["auto_compacted"] = auto_compacted
         exhausted = ChatMessage(
             role=Role.ASSISTANT,
             content=f"Reached maximum tool iterations ({self.max_iterations}) without a final summary.",
-            metadata={
-                "turn_usage": turn_usage,
-                "tool_calls_count": tool_calls_count,
-                "context_messages": len(messages),
-            },
+            metadata=exhausted_meta,
         )
         await self._persist_message(session_id, exhausted, platform=platform)
         await self._emit(stream_callback, exhausted.content)

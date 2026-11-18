@@ -442,8 +442,16 @@ async def test_agent_auto_compacts_when_token_budget_exceeded(tmp_path):
     mock_llm.model = "gpt-4o-mini"
     mock_llm.chat_completion = AsyncMock(
         side_effect=[
-            ChatMessage(role=Role.ASSISTANT, content="Summary of earlier work."),
-            ChatMessage(role=Role.ASSISTANT, content="Final answer after compact."),
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="Summary of earlier work.",
+                metadata={"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+            ),
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="Final answer after compact.",
+                metadata={"usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}},
+            ),
         ]
     )
 
@@ -453,6 +461,8 @@ async def test_agent_auto_compacts_when_token_budget_exceeded(tmp_path):
 
     assert reply.content == "Final answer after compact."
     assert reply.metadata.get("auto_compacted", {}).get("removed_messages", 0) > 0
+    assert reply.metadata["turn_usage"]["api_calls"] == 2
+    assert reply.metadata["turn_usage"]["total_tokens"] == 180
     sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
     assert sent_messages[0].role == Role.SYSTEM
     await store.close()

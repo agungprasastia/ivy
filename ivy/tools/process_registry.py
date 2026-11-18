@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import ctypes
+import os
 import platform
+import signal
 import subprocess
 import time
 from collections import deque
@@ -16,6 +20,90 @@ from ivy.core.prompt import redact_secrets, truncate_head_tail
 from ivy.core.types import ToolResult
 from ivy.tools.base import BaseTool
 from ivy.tools.runner import terminate_process_tree
+
+
+def _create_win_job(proc: asyncio.subprocess.Process) -> int | None:
+    """Attach a Windows process to a Job Object so descendants die even after the shell exits."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes.wintypes as wt
+
+        transport = getattr(proc, "_transport", None)
+        sub = transport.get_extra_info("subprocess") if transport is not None else None
+        proc_handle = getattr(sub, "_handle", None)
+        if not proc_handle:
+            return None
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wt.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wt.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wt.DWORD),
+                ("SchedulingClass", wt.DWORD),
+            ]
+
+        class _ExtLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wt.HANDLE
+        k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtLimit()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
+            return None
+        if not k32.AssignProcessToJobObject(job, int(proc_handle)):
+            k32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:
+        return None
+
+
+def _terminate_win_job(job_handle: int | None) -> None:
+    """Terminate and close a Windows Job Object handle."""
+    if job_handle is None or platform.system() != "Windows":
+        return
+    try:
+        import ctypes.wintypes as wt
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+        k32.TerminateJobObject(wt.HANDLE(job_handle), 1)
+        k32.CloseHandle(wt.HANDLE(job_handle))
+    except Exception:
+        pass
 
 
 def build_shell_command(command: str) -> list[str]:
@@ -63,6 +151,7 @@ class BackgroundProcess:
     output_chunks: deque[str] = field(default_factory=deque)
     total_chars: int = 0
     exit_code: int | None = None
+    job_handle: int | None = None
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
 
 
@@ -78,22 +167,30 @@ class BackgroundProcessManager:
             return
         bp.output_chunks.append(text)
         bp.total_chars += len(text)
-        while bp.total_chars > self.max_output_chars and bp.output_chunks:
-            dropped = bp.output_chunks.popleft()
-            bp.total_chars -= len(dropped)
+        if bp.total_chars > self.max_output_chars:
+            scrubbed = redact_secrets("".join(bp.output_chunks))
+            if len(scrubbed) > self.max_output_chars:
+                scrubbed = scrubbed[-self.max_output_chars:]
+            bp.output_chunks.clear()
+            if scrubbed:
+                bp.output_chunks.append(scrubbed)
+            bp.total_chars = len(scrubbed)
 
     async def _drain_stream(
         self, bp: BackgroundProcess, stream: asyncio.StreamReader | None
     ) -> None:
         if stream is None:
             return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
                 chunk = await stream.read(4096)
                 if not chunk:
                     break
-                decoded = chunk.decode("utf-8", errors="replace")
+                decoded = decoder.decode(chunk, final=False)
                 self._append_output(bp, decoded)
+            tail = decoder.decode(b"", final=True)
+            self._append_output(bp, tail)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -115,6 +212,7 @@ class BackgroundProcessManager:
         shell_cmd = build_shell_command(command)
         exec_kwargs = spawn_shell_kwargs(working_dir=working_dir, with_stdin=True)
         proc = await asyncio.create_subprocess_exec(*shell_cmd, **exec_kwargs)
+        job_handle = _create_win_job(proc)
 
         process_id = f"proc_{uuid4().hex[:8]}"
         bp = BackgroundProcess(
@@ -125,6 +223,7 @@ class BackgroundProcessManager:
             started_at=datetime.now(timezone.utc).isoformat(),
             started_monotonic=time.monotonic(),
             proc=proc,
+            job_handle=job_handle,
         )
         bp.tasks = [
             asyncio.create_task(self._drain_stream(bp, proc.stdout)),
@@ -176,8 +275,10 @@ class BackgroundProcessManager:
         body = scrubbed or "(no output yet)"
         return True, f"{header}\n{body}"
 
-    async def write_stdin(self, process_id: str, data: str) -> tuple[bool, str]:
-        """Write UTF-8 text to stdin of a running background process."""
+    async def write_stdin(
+        self, process_id: str, data: str, write_timeout: float = 5.0
+    ) -> tuple[bool, str]:
+        """Write UTF-8 text to stdin of a running background process with bounded backpressure wait."""
         bp = self._processes.get(process_id)
         if bp is None:
             return False, f"Process '{process_id}' not found."
@@ -188,13 +289,18 @@ class BackgroundProcessManager:
             return False, f"Process '{process_id}' stdin is closed."
         try:
             stdin.write(data.encode("utf-8"))
-            await stdin.drain()
+            await asyncio.wait_for(stdin.drain(), timeout=write_timeout)
             return True, f"Sent {len(data)} chars to '{process_id}'."
+        except asyncio.TimeoutError:
+            return False, (
+                f"Timed out waiting for '{process_id}' stdin drain after {write_timeout}s; "
+                "some bytes may already have been queued."
+            )
         except Exception as exc:
             return False, f"Failed writing stdin to '{process_id}': {exc}"
 
     async def stop(self, process_id: str) -> tuple[bool, str]:
-        """Terminate a background process tree and wait for reader tasks to unwind."""
+        """Terminate a background process tree and descendants, even if the shell exited."""
         bp = self._processes.get(process_id)
         if bp is None:
             return False, f"Process '{process_id}' not found."
@@ -202,6 +308,14 @@ class BackgroundProcessManager:
         if bp.proc.stdin is not None and not bp.proc.stdin.is_closing():
             bp.proc.stdin.close()
         await terminate_process_tree(bp.proc)
+        if platform.system() == "Windows":
+            _terminate_win_job(bp.job_handle)
+            bp.job_handle = None
+        elif bp.pid:
+            try:
+                os.killpg(bp.pid, signal.SIGKILL)
+            except OSError:
+                pass
         for task in bp.tasks:
             if not task.done():
                 task.cancel()

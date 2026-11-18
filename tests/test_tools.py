@@ -567,3 +567,128 @@ async def test_background_read_output_redacts_secret_across_tail_boundary(tmp_pa
     ok, out = mgr.read_output("proc_sec", tail_chars=22)
     assert ok is True
     assert "boundarysecret123456" not in out
+
+
+@pytest.mark.asyncio
+async def test_background_process_utf8_eviction_redaction_stdin_timeout_and_descendants(tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from ivy.tools.process_registry import BackgroundProcess, BackgroundProcessManager
+
+    # 1. Incremental UTF-8 decode across chunk boundaries
+    mgr = BackgroundProcessManager(max_output_chars=1_000)
+    reader = asyncio.StreamReader()
+    euro = "€".encode("utf-8")  # b"\xe2\x82\xac"
+    reader.feed_data(euro[:1])
+    bp_utf8 = BackgroundProcess(
+        process_id="p_utf8",
+        command="utf8",
+        working_dir=None,
+        pid=1,
+        started_at="2026-11-18T00:00:00+00:00",
+        started_monotonic=0.0,
+        proc=SimpleNamespace(returncode=0),  # type: ignore[arg-type]
+    )
+    mgr._processes["p_utf8"] = bp_utf8
+    drain_task = asyncio.create_task(mgr._drain_stream(bp_utf8, reader))
+    await asyncio.sleep(0.05)
+    reader.feed_data(euro[1:])
+    reader.feed_eof()
+    await drain_task
+    ok, u_out = mgr.read_output("p_utf8")
+    assert ok and "€" in u_out and "\ufffd" not in u_out
+
+    # 2. Oversized chunk retains newest chars AND redacts assignment before prefix eviction
+    bp_evict = BackgroundProcess(
+        process_id="p_evict",
+        command="evict",
+        working_dir=None,
+        pid=2,
+        started_at="2026-11-18T00:00:00+00:00",
+        started_monotonic=0.0,
+        proc=SimpleNamespace(returncode=0),  # type: ignore[arg-type]
+    )
+    mgr._processes["p_evict"] = bp_evict
+    mgr._append_output(bp_evict, "OLD_" * 100 + "NEW_TAIL_" + ("y" * 1200) + "_END")
+    ok_ov, ov_out = mgr.read_output("p_evict", tail_chars=2_000)
+    assert ok_ov and ov_out.endswith("_END")
+
+    bp_evict_sec = BackgroundProcess(
+        process_id="p_esec",
+        command="esec",
+        working_dir=None,
+        pid=3,
+        started_at="2026-11-18T00:00:00+00:00",
+        started_monotonic=0.0,
+        proc=SimpleNamespace(returncode=0),  # type: ignore[arg-type]
+    )
+    mgr._processes["p_esec"] = bp_evict_sec
+    mgr._append_output(bp_evict_sec, "OPENAI_API_KEY=evictsecretvalue999\n" + ("x" * 985))
+    _, es_out = mgr.read_output("p_esec", tail_chars=1_000)
+    assert "evictsecretvalue999" not in es_out
+
+    # 3. Stdin drain timeout returns structured error mentioning queued bytes
+    class HangingStdin:
+        def is_closing(self):
+            return False
+
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            await asyncio.sleep(5.0)
+
+    bp_hang = BackgroundProcess(
+        process_id="p_hang",
+        command="hang",
+        working_dir=None,
+        pid=4,
+        started_at="2026-11-18T00:00:00+00:00",
+        started_monotonic=0.0,
+        proc=SimpleNamespace(returncode=None, stdin=HangingStdin()),  # type: ignore[arg-type]
+    )
+    mgr._processes["p_hang"] = bp_hang
+    ok_w, msg_w = await mgr.write_stdin("p_hang", "payload", write_timeout=0.05)
+    assert ok_w is False and "queued" in msg_w.lower()
+
+    # 4. Detached descendant process is terminated even after parent shell exits
+    pid_file = tmp_path / "child.pid"
+    launcher = tmp_path / "spawn_detached.py"
+    launcher.write_text(
+        "import pathlib, subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"pathlib.Path(r'{pid_file}').write_text(str(p.pid), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    cmd = f'& "{sys.executable}" "{launcher}"' if sys.platform == "win32" else f'"{sys.executable}" "{launcher}"'
+    bp_tree = await mgr.spawn(cmd, working_dir=str(tmp_path))
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while (not pid_file.exists() or bp_tree.proc.returncode is None) and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.1)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+
+    await mgr.stop(bp_tree.process_id)
+    await asyncio.sleep(0.2)
+
+    # Confirm child_pid is no longer running
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        k32 = ctypes.WinDLL("kernel32")
+        k32.OpenProcess.restype = wt.HANDLE
+        h = k32.OpenProcess(0x1000, False, child_pid)
+        if h:
+            code = wt.DWORD()
+            k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            assert code.value != 259
+    else:
+        import os
+
+        try:
+            os.kill(child_pid, 0)
+            raise AssertionError(f"Descendant {child_pid} still alive after stop()")
+        except ProcessLookupError:
+            pass

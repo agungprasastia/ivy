@@ -29,6 +29,13 @@ _TOOL_GROUPS: dict[str, str] = {
     "web_fetch": "web",
     "web_search": "web",
     "read_skill": "skills",
+    "skill_manage": "skills",
+    "todo_list": "planning",
+    "clarify": "planning",
+    "delegate_task": "agents",
+    "remember_preference": "memory",
+    "session_search": "memory",
+    "cron_manage": "automation",
 }
 
 
@@ -39,7 +46,7 @@ def create_console() -> Console:
 def _group_tools(tool_names: list[str]) -> dict[str, list[str]]:
     grouped: dict[str, list[str]] = {}
     for name in sorted(tool_names):
-        group = _TOOL_GROUPS.get(name, "other")
+        group = "mcp" if name.startswith("mcp_") else _TOOL_GROUPS.get(name, "other")
         grouped.setdefault(group, []).append(name)
     return grouped
 
@@ -281,16 +288,18 @@ def render_help_table(
         ("/session | /resume", "Interactive session switcher (Ctrl+N new, Del remove)"),
         ("/new [name]", "Start a fresh session (alias: /reset)"),
         ("/fork [name] | /rewind [N]", "Branch session or roll back to an earlier user prompt"),
+        ("/rollback [list|diff|restore]", "Inspect diff or restore pre-edit file checkpoints"),
         ("/title [name] | /history [N]", "Set session title or show turns with timestamps"),
         ("/undo | /retry", "Remove last turn or undo & re-send last prompt"),
         ("/save [md|json] | /copy [N]", "Export session or copy assistant reply to clipboard"),
         ("/status | /context | /usage", "Inspect session state, token meter & API usage"),
         ("/compact [focus] | /btw <q>", "Summarize older turns or ask off-record side question"),
         ("/diff [--stat] | /doctor [--fix]", "Inspect workspace diff or diagnose Ivy install"),
+        ("/init | /review | /goal", "Generate AGENTS.md, audit diff via subagent, or verification loop"),
         ("/reasoning [mode] | /verbose [mode]", "Control <think> display or tool detail (compact/verbose/focus)"),
         ("/focus [on|off] | /yolo", "Distraction-free view or session auto-approve toggle"),
         ("/todo [clear] | /profile [list|set]", "View session task checklist or long-term preferences"),
-        ("/cron list|add|pause|resume|remove", "Manage persisted scheduled background tasks"),
+        ("/cron ... | /mcp [list|reload]", "Manage persisted cron jobs or .mcp.json stdio servers"),
         ("/skills list|inspect|remove|reflect", "Manage and synthesize skills"),
         ("/memory <query>", "Search conversation history via SQLite FTS5"),
         ("/setup [base] [key] [model]", "Configure API endpoint/key & save to .env"),
@@ -619,4 +628,67 @@ def render_profile_table(
     table.add_column("Value")
     for k, v in sorted(profile.items()):
         table.add_row(escape(k), escape(v))
+    console.print(table)
+
+
+def render_checkpoints_table(
+    console: Console,
+    checkpoints: list[Any],
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display pre-edit file checkpoints for /rollback."""
+    t = theme or get_theme()
+    if not checkpoints:
+        console.print("[dim]No file checkpoints recorded in this session yet.[/dim]")
+        return
+    table = Table(
+        title=f"[{t.banner_title}]File Checkpoints (/rollback restore <id>)[/]",
+        box=box.ROUNDED,
+        border_style=t.banner_border,
+    )
+    table.add_column("ID", justify="right", style=f"bold {t.ui_label}", width=4)
+    table.add_column("Tool", style=t.ui_accent)
+    table.add_column("Action")
+    table.add_column("Path")
+    table.add_column("When", style="dim")
+    for cp in checkpoints[:20]:
+        kind = "modified" if cp.existed_before else "created"
+        table.add_row(
+            str(cp.id),
+            cp.tool_name,
+            kind,
+            escape(cp.display_path),
+            format_relative_time(cp.timestamp),
+        )
+    console.print(table)
+
+
+def render_mcp_table(
+    console: Console,
+    servers: list[dict[str, Any]],
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display connected/errored stdio MCP servers."""
+    t = theme or get_theme()
+    if not servers:
+        console.print("[dim]No MCP servers loaded (add `.mcp.json` and run `/mcp reload`).[/dim]")
+        return
+    table = Table(
+        title=f"[{t.banner_title}]MCP Servers (.mcp.json)[/]",
+        box=box.ROUNDED,
+        border_style=t.banner_border,
+    )
+    table.add_column("Server", style=f"bold {t.ui_label}")
+    table.add_column("Status")
+    table.add_column("Tools", justify="right")
+    table.add_column("Note", style="dim")
+    for s in servers:
+        st = s.get("status", "")
+        st_fmt = f"[{t.ui_ok}]{st}[/]" if st == "connected" else f"[{t.ui_error}]{st}[/]"
+        table.add_row(
+            escape(str(s.get("name", ""))),
+            st_fmt,
+            str(s.get("tools", 0)),
+            escape(str(s.get("error", ""))),
+        )
     console.print(table)

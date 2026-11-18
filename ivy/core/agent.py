@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from collections import defaultdict
@@ -99,6 +100,16 @@ class IvyAgent:
             turn_usage["completion_tokens"] += int(msg_usage.get("completion_tokens", 0) or 0)
             turn_usage["total_tokens"] += int(msg_usage.get("total_tokens", 0) or 0)
 
+    def _is_batch_concurrent_safe(self, tool_calls: list[Any]) -> bool:
+        """True when 2+ tool calls in one batch are all marked concurrent_safe."""
+        if len(tool_calls) < 2 or not hasattr(self.tool_registry, "get"):
+            return False
+        for tc in tool_calls:
+            tool_obj = self.tool_registry.get(tc.function_name)
+            if tool_obj is None or not getattr(tool_obj, "concurrent_safe", False):
+                return False
+        return True
+
     async def _emit(
         self, callback: Callable[[Any], Any] | None, payload: Any
     ) -> None:
@@ -185,19 +196,39 @@ class IvyAgent:
 
             used_tools = True
 
-            for tc in reply.tool_calls:
-                tool_calls_count += 1
-                await self._emit(
-                    tool_callback,
-                    {"phase": "start", "name": tc.function_name, "arguments": tc.arguments},
-                )
+            async def _run_one(tc_item: Any) -> tuple[Any, float]:
                 t0 = time.monotonic()
-                result = await self.tool_registry.execute(
-                    tool_name=tc.function_name,
-                    arguments=tc.arguments,
-                    tool_call_id=tc.id,
+                res = await self.tool_registry.execute(
+                    tool_name=tc_item.function_name,
+                    arguments=tc_item.arguments,
+                    tool_call_id=tc_item.id,
                 )
-                elapsed_s = round(time.monotonic() - t0, 3)
+                return res, round(time.monotonic() - t0, 3)
+
+            outcomes: list[tuple[Any, Any, float]] = []
+            if self._is_batch_concurrent_safe(reply.tool_calls):
+                for tc in reply.tool_calls:
+                    tool_calls_count += 1
+                    await self._emit(
+                        tool_callback,
+                        {"phase": "start", "name": tc.function_name, "arguments": tc.arguments},
+                    )
+                executed = await asyncio.gather(*(_run_one(tc) for tc in reply.tool_calls))
+                outcomes = [
+                    (tc, res, elapsed_s)
+                    for tc, (res, elapsed_s) in zip(reply.tool_calls, executed)
+                ]
+            else:
+                for tc in reply.tool_calls:
+                    tool_calls_count += 1
+                    await self._emit(
+                        tool_callback,
+                        {"phase": "start", "name": tc.function_name, "arguments": tc.arguments},
+                    )
+                    res, elapsed_s = await _run_one(tc)
+                    outcomes.append((tc, res, elapsed_s))
+
+            for tc, result, elapsed_s in outcomes:
                 await self._emit(
                     tool_callback,
                     {
@@ -211,7 +242,6 @@ class IvyAgent:
                         "metadata": result.metadata,
                     },
                 )
-
                 tool_msg = ChatMessage(
                     role=Role.TOOL,
                     name=tc.function_name,

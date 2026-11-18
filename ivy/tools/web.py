@@ -55,6 +55,7 @@ class WebFetchTool(BaseTool):
     """Fetch a web URL and extract readable text content."""
 
     name = "web_fetch"
+    concurrent_safe = True
     description = "Fetch an HTTP/HTTPS URL and extract its readable text content."
     parameters = {
         "type": "object",
@@ -95,6 +96,7 @@ class WebSearchTool(BaseTool):
     """Perform web search via DuckDuckGo HTML endpoint without requiring API keys."""
 
     name = "web_search"
+    concurrent_safe = True
     description = "Search the web for a query and return top result titles and URLs."
     parameters = {
         "type": "object",

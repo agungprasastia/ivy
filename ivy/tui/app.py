@@ -39,12 +39,17 @@ from ivy.skills.engine import SkillEngine
 from ivy.skills.generator import SkillGenerator
 from ivy.skills.tool import ReadSkillTool
 from ivy.tools.approval import SafetyApprovalPolicy
+from ivy.tools.checkpoint import FileCheckpointStore
 from ivy.tools.clarify import ClarifyTool
+from ivy.tools.cron_tool import CronManageTool
 from ivy.tools.delegate import DelegateTaskTool
 from ivy.tools.files import FileTools
+from ivy.tools.mcp import MCPManager
 from ivy.tools.profile import RememberPreferenceTool
 from ivy.tools.registry import ToolRegistry
 from ivy.tools.runner import CodeRunnerTool
+from ivy.tools.session_search import SessionSearchTool
+from ivy.tools.skill_manager import SkillManagerTool
 from ivy.tools.terminal import TerminalTool
 from ivy.tools.todo import TodoListTool, TodoStore
 from ivy.tools.web import WebFetchTool, WebSearchTool
@@ -74,11 +79,13 @@ from ivy.tui.views import (
     create_console,
     render_assistant_reply,
     render_banner,
+    render_checkpoints_table,
     render_context_panel,
     render_diff_output,
     render_error,
     render_help_table,
     render_history_view,
+    render_mcp_table,
     render_memory_results,
     render_profile_table,
     render_sessions_table,
@@ -161,6 +168,8 @@ def build_default_tool_registry(
     memory_store: MemoryStore | None = None,
     llm_client: LLMClient | None = None,
     todo_store: TodoStore | None = None,
+    checkpoint_store: FileCheckpointStore | None = None,
+    cron_scheduler: CronScheduler | None = None,
     session_id_getter: Callable[[], str] | None = None,
     clarify_callback: Callable[[str, list[str], bool], Any] | None = None,
 ) -> ToolRegistry:
@@ -173,7 +182,10 @@ def build_default_tool_registry(
         approval_callback=approval_callback,
     )
     registry.register(TerminalTool(approval_policy=policy))
-    FileTools().register_all(registry)
+    FileTools(
+        checkpoint_store=checkpoint_store,
+        session_id_getter=session_id_getter,
+    ).register_all(registry)
     registry.register(CodeRunnerTool(timeout=config.code_runner_timeout))
     registry.register(WebFetchTool())
     registry.register(WebSearchTool())
@@ -182,8 +194,14 @@ def build_default_tool_registry(
         registry.register(ClarifyTool(clarify_callback=clarify_callback))
     if memory_store is not None:
         registry.register(RememberPreferenceTool(memory_store=memory_store))
+        registry.register(SessionSearchTool(memory_store=memory_store))
     if skill_engine is not None:
         registry.register(ReadSkillTool(skill_engine=skill_engine))
+        registry.register(SkillManagerTool(skill_engine=skill_engine))
+    if cron_scheduler is not None:
+        registry.register(
+            CronManageTool(cron_scheduler=cron_scheduler, memory_store=memory_store)
+        )
     if llm_client is not None:
         runner = SubagentRunner(
             llm_client=llm_client,
@@ -232,6 +250,8 @@ class IvyCLIApp:
         self.display_mode: str = "verbose" if getattr(config, "verbose", False) else "compact"
         self.reasoning_mode: str = "collapsed"
         self.todo_store: TodoStore = self._discover_todo_store() or TodoStore()
+        self.checkpoint_store: FileCheckpointStore = self._discover_checkpoint_store() or FileCheckpointStore()
+        self.mcp_manager: MCPManager = MCPManager()
         self._active_status: Any = None
         self._prompt_session: Any = None
         self._session_title: str | None = None
@@ -257,6 +277,21 @@ class IvyCLIApp:
         try:
             tool = registry.get("todo_list")
             return getattr(tool, "store", None)
+        except Exception:
+            return None
+
+    def _discover_checkpoint_store(self) -> FileCheckpointStore | None:
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get"):
+            return None
+        try:
+            wf = registry.get("write_file")
+            cp = getattr(wf, "checkpoint_store", None)
+            if isinstance(cp, FileCheckpointStore):
+                return cp
+            pf = registry.get("patch_file")
+            cp2 = getattr(pf, "checkpoint_store", None)
+            return cp2 if isinstance(cp2, FileCheckpointStore) else None
         except Exception:
             return None
 
@@ -645,6 +680,200 @@ class IvyCLIApp:
             f"[{self.theme.ui_ok}]Rewound {deleted} messages[/] — prompt loaded for edit/resend."
         )
 
+    async def _handle_rollback(self, args: list[str]) -> None:
+        """Inspect, diff, or restore pre-edit FileCheckpoint snapshots."""
+        action = args[0].lower() if args else "list"
+        if action == "list":
+            cps = self.checkpoint_store.list_checkpoints(session_id=self.session_id)
+            if not cps:
+                cps = self.checkpoint_store.list_checkpoints(session_id=None)
+            render_checkpoints_table(self.console, cps, theme=self.theme)
+            return
+
+        cp = None
+        if len(args) >= 2 and args[1].isdigit():
+            cp = self.checkpoint_store.get(int(args[1]))
+        else:
+            cp = self.checkpoint_store.latest(session_id=self.session_id) or self.checkpoint_store.latest()
+
+        if cp is None:
+            self.console.print(f"[{self.theme.ui_warn}]No matching file checkpoint found.[/]")
+            return
+
+        if action == "diff":
+            diff_text = self.checkpoint_store.diff_checkpoint(cp.id)
+            render_diff_output(self.console, diff_text, theme=self.theme)
+            return
+
+        if action == "restore":
+            ok, msg = self.checkpoint_store.restore_checkpoint(cp.id)
+            color = self.theme.ui_ok if ok else self.theme.ui_error
+            self.console.print(f"[{color}]{rich_escape(msg)}[/]")
+            return
+
+        self.console.print(f"[{self.theme.ui_warn}]Usage: /rollback [list | diff [id] | restore [id]][/]")
+
+    async def _handle_init(self, args: list[str]) -> None:
+        """Ask Ivy to inspect the repository and write/update AGENTS.md."""
+        notes = " ".join(args).strip()
+        extra = f" Extra focus notes: {notes}." if notes else ""
+        prompt = (
+            "Inspect this workspace (directory layout, manifests like pyproject.toml/package.json, "
+            "run/test commands, and conventions) and write or update a concise, factual `AGENTS.md` file "
+            "at the repository root capturing architecture, build/test commands, and coding rules."
+            f"{extra}"
+        )
+        await self._run_turn_with_live_stream(prompt)
+
+    async def _handle_review(self, args: list[str]) -> None:
+        """Audit uncommitted git diff using an isolated SubagentRunner or direct LLM critique."""
+        focus = " ".join(args).strip()
+        diff_text = run_git_diff(staged=False) or run_git_diff(staged=True)
+        if not diff_text or diff_text.startswith("git "):
+            self.console.print("[dim]No uncommitted git diff to review (run `/diff` to verify).[/dim]")
+            return
+
+        focus_line = f"Focus specifically on: {focus}.\n" if focus else ""
+        review_prompt = (
+            "Perform a concise, rigorous code review of the uncommitted git diff below. "
+            "Highlight real bugs, regressions, security issues, missing edge-case guards, or missing tests.\n"
+            f"{focus_line}\n```diff\n{diff_text[:10000]}\n```"
+        )
+        status = self.console.status(
+            f"[{self.theme.ui_accent}]{self.theme.glyph} Auditing changes (/review)...[/]",
+            spinner="dots",
+        )
+        try:
+            with status:
+                reg = getattr(self.agent, "tool_registry", None)
+                if isinstance(reg, ToolRegistry):
+                    read_tools = [
+                        t.name for t in reg.list_tools() if getattr(t, "concurrent_safe", False)
+                    ]
+                    reviewer = SubagentRunner(
+                        llm_client=self.llm_client,
+                        tool_registry=reg,
+                        memory_store=self.memory_store,
+                        max_iterations=min(4, self.config.subagent_max_iterations),
+                    )
+                    report = await reviewer.run(
+                        task_prompt=review_prompt,
+                        parent_session_id=self.session_id,
+                        allowed_tools=read_tools,
+                    )
+                else:
+                    reply = await self.llm_client.chat_completion(
+                        messages=[
+                            ChatMessage(role=Role.SYSTEM, content="You are an expert code reviewer."),
+                            ChatMessage(role=Role.USER, content=review_prompt),
+                        ],
+                        stream=False,
+                    )
+                    report = reply.content if isinstance(reply, ChatMessage) else ""
+            visible, _ = extract_thinking_blocks(report or "")
+            self.console.print(
+                RichPanel(
+                    Markdown(visible or report or "No issues found."),
+                    title=f"[bold {self.theme.banner_title}]{self.theme.glyph} Code Review[/]",
+                    border_style=self.theme.banner_border,
+                    box=rich_box.ROUNDED,
+                    expand=False,
+                )
+            )
+        except Exception as exc:
+            render_error(self.console, exc, theme=self.theme)
+
+    async def _handle_goal(self, raw_args: str) -> None:
+        """Autonomous /goal loop with optional --gate \"<shell_cmd>\" and --max-turns N."""
+        try:
+            tokens = shlex.split(raw_args)
+        except ValueError:
+            tokens = raw_args.split()
+
+        gate_cmd: str | None = None
+        max_turns = 5
+        obj_parts: list[str] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--gate" and i + 1 < len(tokens):
+                gate_cmd = tokens[i + 1]
+                i += 2
+            elif tok == "--max-turns" and i + 1 < len(tokens):
+                try:
+                    max_turns = max(1, min(15, int(tokens[i + 1])))
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                obj_parts.append(tok)
+                i += 1
+
+        objective = " ".join(obj_parts).strip()
+        if not objective:
+            self.console.print(
+                f"[{self.theme.ui_warn}]Usage: /goal <objective> [--gate \"<command>\"] [--max-turns 5][/]"
+            )
+            return
+
+        current_prompt = objective
+        for idx in range(1, max_turns + 1):
+            self.console.print(
+                f"\n[bold {self.theme.ui_accent}]⊙ Goal iteration {idx}/{max_turns}[/]"
+                + (f" [dim](gate: {rich_escape(gate_cmd)})[/dim]" if gate_cmd else "")
+            )
+            await self._run_turn_with_live_stream(current_prompt)
+            if not gate_cmd:
+                return
+
+            proc = await asyncio.create_subprocess_shell(
+                gate_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            except asyncio.TimeoutError:
+                self.console.print(f"[{self.theme.ui_error}]✗ Gate command timed out (60s).[/]")
+                return
+
+            if proc.returncode == 0:
+                self.console.print(
+                    f"[bold {self.theme.ui_ok}]✓ Verification gate passed ({rich_escape(gate_cmd)})![/]"
+                )
+                return
+
+            combined = (
+                stdout_b.decode("utf-8", errors="replace")
+                + "\n"
+                + stderr_b.decode("utf-8", errors="replace")
+            ).strip()
+            self.console.print(
+                f"[{self.theme.ui_warn}]✗ Gate failed (exit {proc.returncode}); feeding output to next iteration...[/]"
+            )
+            current_prompt = (
+                f"Verification gate `{gate_cmd}` failed with exit code {proc.returncode}.\n"
+                f"Output:\n```\n{combined[-1500:]}\n```\n\n"
+                f"Fix the remaining issues to accomplish the goal: {objective}"
+            )
+
+        self.console.print(
+            f"[{self.theme.ui_error}]Goal reached max turns ({max_turns}) with gate still failing.[/]"
+        )
+
+    async def _handle_mcp(self, args: list[str]) -> None:
+        action = args[0].lower() if args else "list"
+        reg = getattr(self.agent, "tool_registry", None)
+        if action == "reload":
+            if not isinstance(reg, ToolRegistry):
+                self.console.print(f"[{self.theme.ui_warn}]ToolRegistry unavailable for MCP reload.[/]")
+                return
+            loaded = await self.mcp_manager.reload(reg)
+            render_mcp_table(self.console, self.mcp_manager.list_servers(), theme=self.theme)
+            self.console.print(f"[dim]Registered {len(loaded)} MCP tool(s).[/dim]")
+            return
+        render_mcp_table(self.console, self.mcp_manager.list_servers(), theme=self.theme)
+
     async def _handle_cron_command(self, raw_line: str, args: list[str]) -> None:
         action = args[0].lower() if args else "list"
         if action == "list":
@@ -968,6 +1197,15 @@ class IvyCLIApp:
                 self.console.print(
                     f"[{self.theme.ui_ok}]Undid last turn[/] (removed {deleted} messages: [dim]{preview}[/dim])"
                 )
+                cps = self.checkpoint_store.list_checkpoints(session_id=self.session_id)
+                if cps:
+                    self.console.print(
+                        f"[dim]Tip: {len(cps)} file checkpoint(s) exist — run `/rollback list` or `/rollback restore` to revert disk edits.[/dim]"
+                    )
+            return True
+
+        if cmd == "/rollback":
+            await self._handle_rollback(args)
             return True
 
         if cmd == "/retry":
@@ -1278,6 +1516,23 @@ class IvyCLIApp:
 
         if cmd == "/palette":
             return await self._run_command_palette()
+
+        if cmd == "/init":
+            await self._handle_init(args)
+            return True
+
+        if cmd == "/review":
+            await self._handle_review(args)
+            return True
+
+        if cmd == "/goal":
+            raw_goal_args = raw_line.strip()[len(parts[0]):].strip()
+            await self._handle_goal(raw_goal_args)
+            return True
+
+        if cmd == "/mcp":
+            await self._handle_mcp(args)
+            return True
 
         if cmd == "/gateway":
             tg_state = "configured" if self.config.telegram_token else "not set"
@@ -1634,6 +1889,7 @@ async def _run_async(args: argparse.Namespace) -> int:
                 approval_policy=gw_policy,
             )
             await cron.load_from_store()
+            registry.register(CronManageTool(cron_scheduler=cron, memory_store=store))
             gw = GatewayServer(
                 agent=agent,
                 config=config,
@@ -1662,6 +1918,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             unattended=False,
         )
         todo_store = TodoStore()
+        checkpoint_store = FileCheckpointStore()
         target_session = args.session
         if getattr(args, "continue_latest", False) and target_session == "cli:main":
             latest = await store.get_latest_session_id()
@@ -1678,6 +1935,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             memory_store=store,
             llm_client=llm,
             todo_store=todo_store,
+            checkpoint_store=checkpoint_store,
             session_id_getter=lambda: session_holder["id"],
         )
         agent = IvyAgent(
@@ -1694,6 +1952,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             approval_policy=cli_policy,
         )
         await cli_cron.load_from_store()
+        registry.register(CronManageTool(cron_scheduler=cli_cron, memory_store=store))
 
         app = IvyCLIApp(
             config=config,
@@ -1711,26 +1970,31 @@ async def _run_async(args: argparse.Namespace) -> int:
             history_path=Path.home() / ".ivy" / "history",
         )
         app.todo_store = todo_store
-        todo_tool = registry.get("todo_list")
-        if isinstance(todo_tool, TodoListTool):
-            todo_tool.session_id_getter = lambda: app.session_id
-        delegate_tool = registry.get("delegate_task")
-        if isinstance(delegate_tool, DelegateTaskTool):
-            delegate_tool.session_id_getter = lambda: app.session_id
+        app.checkpoint_store = checkpoint_store
+        for tool_name in ("todo_list", "delegate_task", "write_file", "patch_file"):
+            t_obj = registry.get(tool_name)
+            if t_obj is not None and hasattr(t_obj, "session_id_getter"):
+                setattr(t_obj, "session_id_getter", lambda: app.session_id)
         clarify_tool = registry.get("clarify")
         if isinstance(clarify_tool, ClarifyTool):
             clarify_tool.clarify_callback = app._interactive_clarify
         cli_policy.approval_callback = app._interactive_approval
-        if args.command == "cron":
-            await app.handle_slash_command("/cron list")
-            return 0
+        if Path(".mcp.json").is_file():
+            await app.mcp_manager.reload(registry)
 
-        if args.prompt:
-            await app._run_turn_with_live_stream(args.prompt)
-            return 0
+        try:
+            if args.command == "cron":
+                await app.handle_slash_command("/cron list")
+                return 0
 
-        await app.run_interactive()
-        return 0
+            if args.prompt:
+                await app._run_turn_with_live_stream(args.prompt)
+                return 0
+
+            await app.run_interactive()
+            return 0
+        finally:
+            await app.mcp_manager.close_all()
     finally:
         await llm.close()
         await store.close()

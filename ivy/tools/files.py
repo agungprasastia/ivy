@@ -6,12 +6,13 @@ import difflib
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from ivy.core.types import ToolResult
 from ivy.tools.base import BaseTool
 
 if TYPE_CHECKING:
+    from ivy.tools.checkpoint import FileCheckpointStore
     from ivy.tools.registry import ToolRegistry
 
 
@@ -43,6 +44,7 @@ class ReadFileTool(BaseTool):
     """Tool to read content from a local file."""
 
     name = "read_file"
+    concurrent_safe = True
     description = "Read text content from a specified file path."
     parameters = {
         "type": "object",
@@ -114,6 +116,14 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
+    def __init__(
+        self,
+        checkpoint_store: FileCheckpointStore | None = None,
+        session_id_getter: Callable[[], str] | None = None,
+    ) -> None:
+        self.checkpoint_store = checkpoint_store
+        self.session_id_getter = session_id_getter
+
     async def execute(
         self,
         path: str,
@@ -123,22 +133,40 @@ class WriteFileTool(BaseTool):
     ) -> ToolResult:
         file_path = Path(path).resolve()
         try:
+            existed_before = file_path.exists() and file_path.is_file()
             before_text = ""
-            if file_path.exists() and file_path.is_file():
+            if existed_before:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                     before_text = f.read()
             after_text = (before_text + content) if append else content
+
+            cp_id: int | None = None
+            if self.checkpoint_store is not None:
+                sid = self.session_id_getter() if self.session_id_getter else "cli:main"
+                cp = self.checkpoint_store.record(
+                    session_id=sid,
+                    path=str(file_path),
+                    display_path=path,
+                    tool_name=self.name,
+                    existed_before=existed_before,
+                    old_content=before_text,
+                    new_content=after_text,
+                )
+                cp_id = cp.id
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if append else "w"
             with open(file_path, mode, encoding="utf-8") as f:
                 f.write(content)
 
+            meta = _build_diff_metadata(path, before_text, after_text)
+            if cp_id is not None:
+                meta["checkpoint_id"] = cp_id
             return ToolResult(
                 tool_name=self.name,
                 status="success",
                 output=f"Successfully wrote {len(content)} characters to {path}",
-                metadata=_build_diff_metadata(path, before_text, after_text),
+                metadata=meta,
             )
         except Exception as exc:
             return ToolResult(
@@ -152,6 +180,7 @@ class ListDirectoryTool(BaseTool):
     """Tool to list entries in a directory."""
 
     name = "list_directory"
+    concurrent_safe = True
     description = "List files and subdirectories within a directory path."
     parameters = {
         "type": "object",
@@ -212,6 +241,14 @@ class PatchFileTool(BaseTool):
         "required": ["path", "target", "replacement"],
     }
 
+    def __init__(
+        self,
+        checkpoint_store: FileCheckpointStore | None = None,
+        session_id_getter: Callable[[], str] | None = None,
+    ) -> None:
+        self.checkpoint_store = checkpoint_store
+        self.session_id_getter = session_id_getter
+
     async def execute(
         self,
         path: str,
@@ -239,14 +276,32 @@ class PatchFileTool(BaseTool):
                 )
 
             updated = content.replace(target, replacement)
+
+            cp_id: int | None = None
+            if self.checkpoint_store is not None:
+                sid = self.session_id_getter() if self.session_id_getter else "cli:main"
+                cp = self.checkpoint_store.record(
+                    session_id=sid,
+                    path=str(file_path),
+                    display_path=path,
+                    tool_name=self.name,
+                    existed_before=True,
+                    old_content=content,
+                    new_content=updated,
+                )
+                cp_id = cp.id
+
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(updated)
 
+            meta = _build_diff_metadata(path, content, updated)
+            if cp_id is not None:
+                meta["checkpoint_id"] = cp_id
             return ToolResult(
                 tool_name=self.name,
                 status="success",
                 output=f"Successfully patched {path}",
-                metadata=_build_diff_metadata(path, content, updated),
+                metadata=meta,
             )
         except Exception as exc:
             return ToolResult(
@@ -260,6 +315,7 @@ class SearchFilesTool(BaseTool):
     """Tool to search text patterns recursively across files in a directory."""
 
     name = "search_files"
+    concurrent_safe = True
     description = "Search for a regex pattern across files in a directory."
     parameters = {
         "type": "object",
@@ -334,11 +390,21 @@ class SearchFilesTool(BaseTool):
 class FileTools:
     """Helper facade for all file tools."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        checkpoint_store: FileCheckpointStore | None = None,
+        session_id_getter: Callable[[], str] | None = None,
+    ) -> None:
         self.read_tool = ReadFileTool()
-        self.write_tool = WriteFileTool()
+        self.write_tool = WriteFileTool(
+            checkpoint_store=checkpoint_store,
+            session_id_getter=session_id_getter,
+        )
         self.list_tool = ListDirectoryTool()
-        self.patch_tool = PatchFileTool()
+        self.patch_tool = PatchFileTool(
+            checkpoint_store=checkpoint_store,
+            session_id_getter=session_id_getter,
+        )
         self.search_tool = SearchFilesTool()
 
     def register_all(self, registry: ToolRegistry) -> None:

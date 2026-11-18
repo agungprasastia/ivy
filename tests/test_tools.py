@@ -364,3 +364,113 @@ async def test_phase2_tools_todo_clarify_delegate_and_profile(tmp_path):
     assert p_res.status == "success"
     assert (await store.get_user_profile())["lang"] == "id"
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_phase3_tools_checkpoint_session_search_skill_cron_and_mcp(tmp_path):
+    import json
+    import sys
+    from ivy.cron.scheduler import CronScheduler
+    from ivy.memory.store import MemoryStore
+    from ivy.skills.engine import SkillEngine
+    from ivy.tools.checkpoint import FileCheckpointStore
+    from ivy.tools.cron_tool import CronManageTool
+    from ivy.tools.files import FileTools
+    from ivy.tools.mcp import MCPManager
+    from ivy.tools.session_search import SessionSearchTool
+    from ivy.tools.skill_manager import SkillManagerTool
+
+    # 1. FileCheckpointStore with WriteFileTool & PatchFileTool
+    cp_store = FileCheckpointStore()
+    ft = FileTools(checkpoint_store=cp_store, session_id_getter=lambda: "cli:cp")
+    created_path = tmp_path / "new_mod.py"
+    w_res = await ft.write_tool.execute(path=str(created_path), content="val = 1\n")
+    assert w_res.metadata["checkpoint_id"] == 1
+    p_res = await ft.patch_tool.execute(path=str(created_path), target="val = 1", replacement="val = 99")
+    assert p_res.metadata["checkpoint_id"] == 2
+    assert "val = 99" in created_path.read_text(encoding="utf-8")
+    assert "-val = 1" in cp_store.diff_checkpoint(2)
+    ok_r, _ = cp_store.restore_checkpoint(2)
+    assert ok_r and "val = 1" in created_path.read_text(encoding="utf-8")
+    ok_del, _ = cp_store.restore_checkpoint(1)
+    assert ok_del and not created_path.exists()
+
+    # 2. SessionSearchTool
+    store = MemoryStore(db_path=str(tmp_path / "p3_tools.db"))
+    await store.initialize()
+    from ivy.core.types import ChatMessage, Role
+
+    await store.save_message("cli:old", ChatMessage(role=Role.USER, content="deployment checklist setup"))
+    await store.save_message("cli:old", ChatMessage(role=Role.ASSISTANT, content="use docker compose up"))
+    search_tool = SessionSearchTool(memory_store=store)
+    assert search_tool.concurrent_safe is True
+    q_res = await search_tool.execute(query="docker")
+    assert "cli:old" in q_res.output
+    r_res = await search_tool.execute(session_id="cli:old")
+    assert "deployment checklist" in r_res.output
+    b_res = await search_tool.execute()
+    assert "cli:old" in b_res.output
+
+    # 3. SkillManagerTool
+    sk_engine = SkillEngine(skills_dir=str(tmp_path / "skills"))
+    sk_tool = SkillManagerTool(skill_engine=sk_engine)
+    c_res = await sk_tool.execute(
+        action="create",
+        name="deploy-guide",
+        description="How to deploy",
+        instructions="1. Build\n2. Push",
+    )
+    assert c_res.status == "success"
+    assert sk_engine.inspect_skill("deploy-guide") is not None
+    u_res = await sk_tool.execute(action="update", name="deploy-guide", instructions="Updated step")
+    assert u_res.status == "success"
+    assert "Updated step" in (sk_engine.read_skill("deploy-guide") or "")
+    d_res = await sk_tool.execute(action="delete", name="deploy-guide")
+    assert d_res.status == "success"
+
+    # 4. CronManageTool
+    sched = CronScheduler(memory_store=store)
+    cron_tool = CronManageTool(cron_scheduler=sched, memory_store=store)
+    assert (await cron_tool.execute(action="add", name="hourly", cron_expr="0 * * * *", prompt="ping")).status == "success"
+    assert "hourly" in (await cron_tool.execute(action="list")).output
+    assert (await cron_tool.execute(action="pause", name="hourly")).status == "success"
+    assert (await store.list_cron_jobs())[0]["enabled"] is False
+    assert (await cron_tool.execute(action="resume", name="hourly")).status == "success"
+    assert (await cron_tool.execute(action="remove", name="hourly")).status == "success"
+
+    # 5. Zero-dependency stdio MCPServer + MCPManager with real Python JSON-RPC server
+    server_script = tmp_path / "fake_mcp.py"
+    server_script.write_text(
+        "import json, sys\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    m = msg.get('method')\n"
+        "    if m == 'initialize':\n"
+        "        out = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'protocolVersion': '2024-11-05', 'capabilities': {}}}\n"
+        "    elif m == 'tools/list':\n"
+        "        out = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': [{'name': 'echo', 'description': 'Echo back', 'inputSchema': {'type': 'object', 'properties': {'msg': {'type': 'string'}}}}]}}\n"
+        "    elif m == 'tools/call':\n"
+        "        txt = msg['params']['arguments'].get('msg', '')\n"
+        "        out = {'jsonrpc': '2.0', 'id': msg['id'], 'result': {'content': [{'type': 'text', 'text': f'mcp:{txt}'}]}}\n"
+        "    else:\n"
+        "        continue\n"
+        "    sys.stdout.write(json.dumps(out) + '\\n')\n"
+        "    sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    mcp_cfg = tmp_path / ".mcp.json"
+    mcp_cfg.write_text(
+        json.dumps({"mcpServers": {"demo": {"command": sys.executable, "args": [str(server_script)]}}}),
+        encoding="utf-8",
+    )
+    reg = ToolRegistry()
+    mcp_mgr = MCPManager(timeout=5.0)
+    try:
+        loaded = await mcp_mgr.reload(reg, config_path=mcp_cfg)
+        assert "mcp_demo_echo" in loaded
+        call_res = await reg.execute("mcp_demo_echo", {"msg": "ivy"})
+        assert call_res.status == "success"
+        assert call_res.output == "mcp:ivy"
+    finally:
+        await mcp_mgr.close_all()
+        await store.close()

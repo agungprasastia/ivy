@@ -335,3 +335,58 @@ async def test_agent_requests_graceful_summary_when_max_iterations_reached(tmp_p
     assert calls[2]["tools"] is None
     assert reply.metadata["tool_calls_count"] == 2
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_executes_concurrent_safe_tools_in_parallel(tmp_path):
+    import asyncio
+
+    store = MemoryStore(db_path=str(tmp_path / "parallel.db"))
+    await store.initialize()
+
+    active = 0
+    peak = 0
+    order = []
+
+    class SlowReadTool(BaseTool):
+        name = "slow_read"
+        concurrent_safe = True
+        description = "Read concurrently"
+        parameters = {"type": "object", "properties": {"label": {"type": "string"}}}
+
+        async def execute(self, label: str = "x", **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.04)
+            order.append(label)
+            active -= 1
+            return ToolResult(tool_name=self.name, status="success", output=f"data:{label}")
+
+    reg = ToolRegistry()
+    reg.register(SlowReadTool())
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        side_effect=[
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(id="c1", function_name="slow_read", arguments={"label": "A"}),
+                    ToolCall(id="c2", function_name="slow_read", arguments={"label": "B"}),
+                ],
+            ),
+            ChatMessage(role=Role.ASSISTANT, content="Done reading."),
+        ]
+    )
+
+    events = []
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=reg, memory_store=store)
+    reply = await agent.run_turn("Read both", tool_callback=events.append)
+    assert reply.content == "Done reading."
+    assert peak == 2
+    end_outputs = [ev["output"] for ev in events if ev["phase"] == "end"]
+    assert end_outputs == ["data:A", "data:B"]
+    await store.close()

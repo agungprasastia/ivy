@@ -731,3 +731,90 @@ async def test_phase2_think_folding_doctor_btw_rewind_stash_and_cron_crud(tmp_pa
     assert await store.list_cron_jobs() == []
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_phase3_rollback_init_review_goal_and_mcp_slash_commands(tmp_path, monkeypatch):
+    import sys
+    from io import StringIO
+    from pathlib import Path
+    from unittest.mock import patch
+    from rich.console import Console
+    from ivy.tools.checkpoint import FileCheckpointStore
+    from ivy.tools.files import FileTools
+
+    monkeypatch.chdir(tmp_path)
+    cfg = IvyConfig(db_path=str(tmp_path / "p3_cli.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+
+    cp_store = FileCheckpointStore()
+    ft = FileTools(checkpoint_store=cp_store, session_id_getter=lambda: "cli:main")
+    target = tmp_path / "sample.py"
+    target.write_text("a = 1\n", encoding="utf-8")
+    await ft.patch_tool.execute(path=str(target), target="a = 1", replacement="a = 2")
+
+    mock_agent = MagicMock()
+    mock_agent.run_turn = AsyncMock(return_value=ChatMessage(role=Role.ASSISTANT, content="Done"))
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=110)
+
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        console=console,
+    )
+    app.checkpoint_store = cp_store
+
+    # 1. /rollback list, diff, restore & /undo hint
+    assert await app.handle_slash_command("/rollback list") is True
+    assert "sample.py" in buf.getvalue()
+    assert await app.handle_slash_command("/rollback diff 1") is True
+    assert "+a = 2" in buf.getvalue()
+    assert await app.handle_slash_command("/rollback restore 1") is True
+    assert target.read_text(encoding="utf-8") == "a = 1\n"
+
+    # 2. /init triggers structured AGENTS.md turn
+    assert await app.handle_slash_command("/init focus on tests") is True
+    sent_prompt = mock_agent.run_turn.call_args.kwargs["prompt"]
+    assert "AGENTS.md" in sent_prompt and "focus on tests" in sent_prompt
+
+    # 3. /review audits diff cleanly
+    with patch("ivy.tui.app.run_git_diff", return_value="diff --git a/x.py b/x.py\n+print(1)"), patch.object(
+        llm, "chat_completion", new=AsyncMock(return_value=ChatMessage(role=Role.ASSISTANT, content="LGTM: no bugs"))
+    ):
+        assert await app.handle_slash_command("/review security") is True
+    assert "LGTM: no bugs" in buf.getvalue()
+
+    # 4. /goal retries when gate fails first and stops once gate passes
+    flag = tmp_path / "gate.flag"
+    checker = tmp_path / "check_gate.py"
+    checker.write_text(
+        "import pathlib, sys\nsys.exit(0 if pathlib.Path('gate.flag').exists() else 1)\n",
+        encoding="utf-8",
+    )
+    gate_cmd = f"{Path(sys.executable).as_posix()} check_gate.py"
+    turn_idx = 0
+
+    async def fake_goal_turn(**kwargs):
+        nonlocal turn_idx
+        turn_idx += 1
+        if turn_idx >= 2:
+            flag.write_text("ok", encoding="utf-8")
+        return ChatMessage(role=Role.ASSISTANT, content=f"Attempt {turn_idx}")
+
+    mock_agent.run_turn = AsyncMock(side_effect=fake_goal_turn)
+    assert await app.handle_slash_command(f'/goal Fix gate --gate "{gate_cmd}" --max-turns 4') is True
+    assert turn_idx == 2
+    assert "Verification gate passed" in buf.getvalue()
+
+    # 5. /mcp list
+    assert await app.handle_slash_command("/mcp list") is True
+    assert "No MCP servers loaded" in buf.getvalue()
+
+    await store.close()

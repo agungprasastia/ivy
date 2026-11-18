@@ -13,6 +13,7 @@ class BaseTool(ABC):
 
     name: str = ""
     description: str = ""
+    concurrent_safe: bool = False
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {},

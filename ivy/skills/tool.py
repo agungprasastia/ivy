@@ -13,6 +13,7 @@ class ReadSkillTool(BaseTool):
     """Retrieve the full markdown instructions for a registered skill."""
 
     name = "read_skill"
+    concurrent_safe = True
     description = "Read the detailed instructions of an available skill by name."
     parameters = {
         "type": "object",

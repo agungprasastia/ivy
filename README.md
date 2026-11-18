@@ -11,7 +11,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/agungprasastia/ivy/actions/workflows/ci.yml"><img src="https://github.com/agungprasastia/ivy/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white" alt="Python 3.11+" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-10B981.svg" alt="License: Apache-2.0" /></a>
+  <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/managed%20with-uv-DE5FE9.svg?logo=uv&logoColor=white" alt="Managed with uv" /></a>
+  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/badge/code%20style-ruff-D7FF64.svg?logo=ruff&logoColor=111827" alt="Code style: ruff" /></a>
+  <a href="https://github.com/agungprasastia/ivy/stargazers"><img src="https://img.shields.io/github/stars/agungprasastia/ivy?style=flat&color=10B981" alt="GitHub Stars" /></a>
 </p>
 
 ---

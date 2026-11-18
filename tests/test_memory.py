@@ -159,3 +159,14 @@ async def test_memory_store_title_undo_fork_and_context_compaction(tmp_path):
     assert "cli:empty_new" not in {s["session_id"] for s in await store.list_sessions()}
 
     await store.close()
+
+
+def test_should_auto_compact_threshold_and_tail_safety():
+    from ivy.memory.context import should_auto_compact
+
+    short_msgs = [ChatMessage(role=Role.USER, content="hello")] * 4
+    assert should_auto_compact(short_msgs, model="gpt-4o", threshold=0.85) is False
+
+    # 128_000 window for gpt-4o -> ~115_000 tokens (~90%)
+    heavy = [ChatMessage(role=Role.USER, content="x" * 46_000) for _ in range(10)]
+    assert should_auto_compact(heavy, model="gpt-4o", threshold=0.85) is True

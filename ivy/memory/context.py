@@ -83,6 +83,25 @@ def compute_context_breakdown(
     }
 
 
+def should_auto_compact(
+    messages: list[ChatMessage],
+    model: str | None = None,
+    tool_schemas: list[dict[str, Any]] | None = None,
+    system_prompt: str = "",
+    threshold: float = 0.85,
+) -> bool:
+    """True when message history reaches the configured fraction of the model context window."""
+    if len(messages) <= 8:
+        return False
+    breakdown = compute_context_breakdown(
+        messages=messages,
+        model=model,
+        tool_schemas=tool_schemas,
+        system_prompt=system_prompt,
+    )
+    return float(breakdown["percent"]) >= float(threshold) * 100.0
+
+
 class ContextWindowManager:
     """Compresses long message histories while keeping system prompts and recent turns."""
 

@@ -274,6 +274,23 @@ class IvyCLIApp(SlashCommandMixin):
         except Exception:
             return None
 
+    def _discover_process_manager(self) -> BackgroundProcessManager | None:
+        if self._process_manager is not None:
+            return self._process_manager
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get"):
+            return None
+        try:
+            proc_tool = registry.get("process")
+            mgr = getattr(proc_tool, "manager", None)
+            if isinstance(mgr, BackgroundProcessManager):
+                return mgr
+            term = registry.get("terminal")
+            mgr2 = getattr(term, "process_manager", None)
+            return mgr2 if isinstance(mgr2, BackgroundProcessManager) else None
+        except Exception:
+            return None
+
     def _discover_approval_policy(self) -> SafetyApprovalPolicy | None:
         registry = getattr(self.agent, "tool_registry", None)
         if registry is None or not hasattr(registry, "get"):

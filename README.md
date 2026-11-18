@@ -154,7 +154,7 @@ Type `/` for autocomplete, or press **`Ctrl+P`** for the fuzzy command palette, 
 | `/compact` | LLM-summarise older turns to reclaim context |
 | `/diff` · `/review` | `git diff` in workspace · LLM diff audit (`/review security`) |
 | `/init` · `/goal` | Generate `AGENTS.md` · autonomous loop with verification `--gate` |
-| `/todo` · `/profile` · `/mcp` | Track tasks · manage preferences · inspect loaded MCP servers |
+| `/todo` · `/profile` · `/mcp` · `/ps` | Track tasks · preferences · MCP servers · background processes |
 | `/verbose` · `/focus` · `/reasoning` | Cycle verbosity · toggle tool hiding · toggle thinking blocks |
 | `/yolo` | Toggle auto-approval of destructive commands for this session |
 | `/prompt` | Compose a multiline prompt in `$EDITOR` |
@@ -197,7 +197,7 @@ When a destructive command is intercepted you choose:
 
 | Tool | Notes |
 |---|---|
-| `terminal` | PowerShell (Windows) / Bash, guarded by `SafetyApprovalPolicy` |
+| `terminal`, `process` | PowerShell / Bash (foreground & `background=true`), guarded by `SafetyApprovalPolicy` |
 | `read_file`, `write_file`, `list_directory`, `patch_file`, `search_files` | Workspace file operations with reversible `FileCheckpointStore` snapshots |
 | `code_runner` | Isolated Python subprocess with timeout (default 30s) |
 | `web_fetch`, `web_search` | Readable text extraction / result lists |
@@ -215,7 +215,7 @@ When a destructive command is intercepted you choose:
 ```
 ivy/
 ├── core/      # agent loop, LLM adapter, prompt & redaction, subagent, types
-├── tools/     # terminal, files, checkpoint, runner, web, registry, approval, mcp, todo, clarify, profile
+├── tools/     # terminal, process_registry, files, checkpoint, runner, web, registry, approval, mcp, todo, clarify, profile
 ├── memory/    # SQLite store, FTS5, context window, profile
 ├── skills/    # SKILL.md engine, generator, read/manage tools
 ├── gateway/   # server, session hub, turn lease, adapters (cli/telegram/discord)

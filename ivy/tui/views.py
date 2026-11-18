@@ -675,3 +675,38 @@ def render_mcp_table(
             escape(str(s.get("error", ""))),
         )
     console.print(table)
+
+
+def render_processes_table(
+    console: Console,
+    processes: list[dict[str, Any]],
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display tracked background shell processes for /ps."""
+    t = theme or get_theme()
+    if not processes:
+        console.print("[dim]No background processes started in this session.[/dim]")
+        return
+    table = Table(
+        title=f"[{t.banner_title}]Background Processes (/ps log <id> | /ps stop <id|all>)[/]",
+        box=box.ROUNDED,
+        border_style=t.banner_border,
+    )
+    table.add_column("ID", style=f"bold {t.ui_label}")
+    table.add_column("PID", justify="right")
+    table.add_column("Status")
+    table.add_column("Elapsed", justify="right", style="dim")
+    table.add_column("Command")
+    for p in processes:
+        st = str(p.get("status", ""))
+        st_fmt = f"[{t.ui_ok}]{st}[/]" if st == "running" else f"[dim]{st} ({p.get('exit_code')})[/]"
+        cmd_raw = str(p.get("command", "")).strip().replace("\n", " ")
+        cmd_short = (cmd_raw[:54] + "…") if len(cmd_raw) > 55 else cmd_raw
+        table.add_row(
+            escape(str(p.get("process_id", ""))),
+            str(p.get("pid") or "—"),
+            st_fmt,
+            f"{p.get('elapsed_s', 0)}s",
+            escape(cmd_short),
+        )
+    console.print(table)

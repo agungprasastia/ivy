@@ -200,12 +200,17 @@ class BackgroundProcessManager:
         if bp is None:
             return False, f"Process '{process_id}' not found."
         was_running = self._refresh_status(bp) == "running"
+        if bp.proc.stdin is not None and not bp.proc.stdin.is_closing():
+            bp.proc.stdin.close()
         await terminate_process_tree(bp.proc)
         for task in bp.tasks:
             if not task.done():
                 task.cancel()
         if bp.tasks:
             await asyncio.gather(*bp.tasks, return_exceptions=True)
+        transport = getattr(bp.proc, "_transport", None)
+        if transport is not None and hasattr(transport, "close"):
+            transport.close()
         self._refresh_status(bp)
         if was_running:
             return True, f"Stopped process '{process_id}' (pid={bp.pid})."

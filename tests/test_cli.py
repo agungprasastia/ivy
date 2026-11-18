@@ -910,38 +910,40 @@ async def test_ps_slash_command_lists_logs_and_stops_processes(tmp_path):
     reg = ToolRegistry()
     reg.register(ProcessManageTool(manager=mgr))
     script = tmp_path / "ps_alive.py"
-    script.write_text("import time; print('bg-alive', flush=True); time.sleep(10)\n", encoding="utf-8")
+    script.write_text("import time; print('bg-alive', flush=True); time.sleep(30)\n", encoding="utf-8")
     cmd = f'& "{sys.executable}" "{script}"' if sys.platform == "win32" else f'"{sys.executable}" "{script}"'
     bp = await mgr.spawn(cmd, working_dir=str(tmp_path))
 
-    deadline = asyncio.get_running_loop().time() + 5.0
-    _, out = mgr.read_output(bp.process_id)
-    while "bg-alive" not in out and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.1)
-        _, out = mgr.read_output(bp.process_id)
-
     store = MemoryStore(db_path=str(tmp_path / "ps.db"))
     await store.initialize()
-    skills = SkillEngine(skills_dir=str(tmp_path / "skills"))
-    cfg = IvyConfig(db_path=str(tmp_path / "ps.db"), skills_dir=str(tmp_path / "skills"))
-    mock_agent = MagicMock()
-    mock_agent.tool_registry = reg
-    buf = StringIO()
-    app = IvyCLIApp(
-        config=cfg,
-        llm_client=LLMClient(cfg),
-        memory_store=store,
-        skill_engine=skills,
-        agent=mock_agent,
-        console=Console(file=buf, force_terminal=False, width=110),
-    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 15.0
+        _, out = mgr.read_output(bp.process_id)
+        while "bg-alive" not in out and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+            _, out = mgr.read_output(bp.process_id)
+        assert "bg-alive" in out
 
-    assert "/ps" in SLASH_COMMANDS
-    assert await app.handle_slash_command("/ps list") is True
-    assert bp.process_id in buf.getvalue()
-    assert await app.handle_slash_command(f"/ps log {bp.process_id}") is True
-    assert "bg-alive" in buf.getvalue()
-    assert await app.handle_slash_command(f"/ps stop {bp.process_id}") is True
+        skills = SkillEngine(skills_dir=str(tmp_path / "skills"))
+        cfg = IvyConfig(db_path=str(tmp_path / "ps.db"), skills_dir=str(tmp_path / "skills"))
+        mock_agent = MagicMock()
+        mock_agent.tool_registry = reg
+        buf = StringIO()
+        app = IvyCLIApp(
+            config=cfg,
+            llm_client=LLMClient(cfg),
+            memory_store=store,
+            skill_engine=skills,
+            agent=mock_agent,
+            console=Console(file=buf, force_terminal=False, width=110),
+        )
 
-    await mgr.shutdown_all()
-    await store.close()
+        assert "/ps" in SLASH_COMMANDS
+        assert await app.handle_slash_command("/ps list") is True
+        assert bp.process_id in buf.getvalue()
+        assert await app.handle_slash_command(f"/ps log {bp.process_id}") is True
+        assert "bg-alive" in buf.getvalue()
+        assert await app.handle_slash_command(f"/ps stop {bp.process_id}") is True
+    finally:
+        await mgr.shutdown_all()
+        await store.close()

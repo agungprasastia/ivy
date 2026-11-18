@@ -83,6 +83,25 @@ def compute_context_breakdown(
     }
 
 
+def should_auto_compact(
+    messages: list[ChatMessage],
+    model: str | None = None,
+    tool_schemas: list[dict[str, Any]] | None = None,
+    system_prompt: str = "",
+    threshold: float = 0.85,
+) -> bool:
+    """True when message history reaches the configured fraction of the model context window."""
+    if len(messages) <= 8:
+        return False
+    breakdown = compute_context_breakdown(
+        messages=messages,
+        model=model,
+        tool_schemas=tool_schemas,
+        system_prompt=system_prompt,
+    )
+    return float(breakdown["percent"]) >= float(threshold) * 100.0
+
+
 class ContextWindowManager:
     """Compresses long message histories while keeping system prompts and recent turns."""
 
@@ -157,12 +176,24 @@ class ContextWindowManager:
 
         transcript_lines = []
         for m in older:
-            body = (m.content or "").strip().replace("\n", " ")
-            if body:
-                transcript_lines.append(f"[{m.role.value}]: {body[:400]}")
+            text_body = (m.content or "").strip().replace("\n", " ")
+            call_parts: list[str] = []
+            for tc in m.tool_calls or []:
+                args_s = json.dumps(tc.arguments, ensure_ascii=False, default=str)
+                if len(args_s) > 120:
+                    args_s = args_s[:117] + "..."
+                call_parts.append(f"{tc.function_name}({args_s})")
+            if call_parts:
+                calls_str = "; ".join(call_parts)
+                combined = f"{text_body} [tool_calls: {calls_str}]".strip() if text_body else f"[tool_calls: {calls_str}]"
+            else:
+                combined = text_body
+            if combined:
+                transcript_lines.append(f"[{m.role.value}]: {combined[:400]}")
         joined = "\n".join(transcript_lines[-40:])
 
         summary_text = ""
+        compaction_usage: dict[str, int] | None = None
         if llm_client is not None:
             focus_clause = f" Pay special attention to: {focus}." if focus else ""
             prompt = (
@@ -179,6 +210,14 @@ class ContextWindowManager:
                     stream=False,
                 )
                 summary_text = (getattr(reply, "content", "") or "").strip()
+                raw_meta = getattr(reply, "metadata", None)
+                u = raw_meta.get("usage") if isinstance(raw_meta, dict) else None
+                compaction_usage = {
+                    "api_calls": 1,
+                    "prompt_tokens": int((u or {}).get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int((u or {}).get("completion_tokens", 0) or 0),
+                    "total_tokens": int((u or {}).get("total_tokens", 0) or 0),
+                }
             except Exception:
                 summary_text = ""
 
@@ -191,9 +230,12 @@ class ContextWindowManager:
         )
         compacted = [summary_msg, *recent]
         after_tokens = sum(estimate_message_tokens(m) for m in compacted)
-        return compacted, {
+        stats: dict[str, Any] = {
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
             "removed_messages": len(older),
             "saved_tokens": max(0, before_tokens - after_tokens),
         }
+        if compaction_usage is not None:
+            stats["compaction_usage"] = compaction_usage
+        return compacted, stats

@@ -12,7 +12,7 @@ from ivy.config import IvyConfig
 from ivy.core.llm import LLMClient
 from ivy.core.prompt import build_system_prompt, format_tool_result
 from ivy.core.types import ChatMessage, Role
-from ivy.memory.context import ContextWindowManager
+from ivy.memory.context import ContextWindowManager, should_auto_compact
 from ivy.memory.store import MemoryStore
 from ivy.skills.engine import SkillEngine
 from ivy.skills.generator import SkillGenerator
@@ -91,6 +91,45 @@ class IvyAgent:
             reply = ChatMessage(role=Role.ASSISTANT, content=text)
         return reply, False
 
+    async def _prepare_context_messages(
+        self,
+        system_prompt: str,
+        history: list[ChatMessage],
+        user_msg: ChatMessage,
+        schemas: list[dict[str, Any]] | None,
+        model_name: str | None,
+    ) -> tuple[list[ChatMessage], dict[str, int] | None]:
+        """Build model messages, auto-compacting via LLM if estimated usage exceeds threshold."""
+        non_system = [*history, user_msg]
+        threshold = (
+            float(getattr(self.config, "auto_compact_threshold", 0.85))
+            if self.config is not None
+            else 0.85
+        )
+        auto_compacted: dict[str, int] | None = None
+        if should_auto_compact(
+            non_system,
+            model=model_name,
+            tool_schemas=schemas,
+            system_prompt=system_prompt,
+            threshold=threshold,
+        ):
+            compacted_non_sys, stats = await self._fallback_context_mgr.compact_with_llm(
+                non_system,
+                llm_client=self.llm_client,
+                keep_recent=8,
+            )
+            messages = [ChatMessage(role=Role.SYSTEM, content=system_prompt), *compacted_non_sys]
+            auto_compacted = stats
+        else:
+            messages = [ChatMessage(role=Role.SYSTEM, content=system_prompt), *non_system]
+
+        if self.memory_store is not None:
+            messages = self.memory_store.compress_context(messages)
+        else:
+            messages = self._fallback_context_mgr.compress(messages)
+        return messages, auto_compacted
+
     @staticmethod
     def _accumulate_usage(turn_usage: dict[str, int], reply: ChatMessage) -> None:
         turn_usage["api_calls"] += 1
@@ -148,21 +187,25 @@ class IvyAgent:
 
         history = await self._load_history(session_id)
         user_msg = ChatMessage(role=Role.USER, content=prompt)
+        raw_schemas = self.tool_registry.get_schemas()
+        messages, auto_compacted = await self._prepare_context_messages(
+            system_prompt=system_prompt,
+            history=history,
+            user_msg=user_msg,
+            schemas=raw_schemas,
+            model_name=model_name,
+        )
 
-        messages: list[ChatMessage] = [
-            ChatMessage(role=Role.SYSTEM, content=system_prompt),
-            *history,
-            user_msg,
-        ]
-        if self.memory_store is not None:
-            messages = self.memory_store.compress_context(messages)
-        else:
-            messages = self._fallback_context_mgr.compress(messages)
-
-        schemas = self.tool_registry.get_schemas() or None
+        schemas = raw_schemas or None
         used_tools = False
         user_persisted = False
         turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "api_calls": 0}
+        comp_usage = auto_compacted.get("compaction_usage") if isinstance(auto_compacted, dict) else None
+        if isinstance(comp_usage, dict):
+            turn_usage["api_calls"] += int(comp_usage.get("api_calls", 0) or 0)
+            turn_usage["prompt_tokens"] += int(comp_usage.get("prompt_tokens", 0) or 0)
+            turn_usage["completion_tokens"] += int(comp_usage.get("completion_tokens", 0) or 0)
+            turn_usage["total_tokens"] += int(comp_usage.get("total_tokens", 0) or 0)
         tool_calls_count = 0
 
         for _ in range(self.max_iterations):
@@ -190,6 +233,8 @@ class IvyAgent:
                 reply.metadata["turn_usage"] = turn_usage
                 reply.metadata["tool_calls_count"] = tool_calls_count
                 reply.metadata["context_messages"] = len(messages)
+                if auto_compacted is not None:
+                    reply.metadata["auto_compacted"] = auto_compacted
                 if reply.content and not did_stream:
                     await self._emit(stream_callback, reply.content)
                 return reply
@@ -273,6 +318,8 @@ class IvyAgent:
                     summary_reply.metadata["turn_usage"] = turn_usage
                     summary_reply.metadata["tool_calls_count"] = tool_calls_count
                     summary_reply.metadata["context_messages"] = len(messages)
+                    if auto_compacted is not None:
+                        summary_reply.metadata["auto_compacted"] = auto_compacted
                     await self._persist_message(session_id, summary_reply, platform=platform)
                     if not did_stream:
                         await self._emit(stream_callback, summary_reply.content)
@@ -280,14 +327,17 @@ class IvyAgent:
             except Exception:
                 pass
 
+        exhausted_meta: dict[str, Any] = {
+            "turn_usage": turn_usage,
+            "tool_calls_count": tool_calls_count,
+            "context_messages": len(messages),
+        }
+        if auto_compacted is not None:
+            exhausted_meta["auto_compacted"] = auto_compacted
         exhausted = ChatMessage(
             role=Role.ASSISTANT,
             content=f"Reached maximum tool iterations ({self.max_iterations}) without a final summary.",
-            metadata={
-                "turn_usage": turn_usage,
-                "tool_calls_count": tool_calls_count,
-                "context_messages": len(messages),
-            },
+            metadata=exhausted_meta,
         )
         await self._persist_message(session_id, exhausted, platform=platform)
         await self._emit(stream_callback, exhausted.content)

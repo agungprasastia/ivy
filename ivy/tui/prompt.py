@@ -59,6 +59,7 @@ SLASH_COMMANDS = [
     "/skills",
     "/gateway",
     "/cron",
+    "/ps",
     "/memory",
     "/theme",
     "/clear",
@@ -103,6 +104,7 @@ SLASH_COMMAND_META: dict[str, str] = {
     "/skills": "List, inspect, remove, or reflect skills",
     "/gateway": "Show Telegram/Discord gateway status",
     "/cron": "Manage scheduled cron tasks (list|add|pause|resume|remove)",
+    "/ps": "List, inspect logs, or stop background processes",
     "/memory": "Search past sessions via SQLite FTS5",
     "/theme": "Switch TUI skin (ivy, hermes, ocean)",
     "/clear": "Clear current session history",
@@ -129,6 +131,11 @@ _SUBCOMMAND_META: dict[str, dict[str, str]] = {
     "/mcp": {
         "list": "Show configured/connected MCP servers",
         "reload": "Reload .mcp.json and connect servers",
+    },
+    "/ps": {
+        "list": "List tracked background processes",
+        "log": "Show recent stdout/stderr: /ps log <process_id>",
+        "stop": "Stop a process or all: /ps stop <process_id|all>",
     },
     "/reasoning": {
         "collapsed": "Hide <think> tags and show compact duration/line count",

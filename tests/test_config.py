@@ -78,3 +78,16 @@ def test_update_env_file_persists_keys_and_theme(tmp_path, monkeypatch):
     assert loaded.effective_api_base == "http://localhost:20128/v1"
     assert loaded.default_model == "openai/claude-sonnet-4-5"
     assert loaded.default_theme == "hermes"
+
+
+def test_load_resilience_config_from_env(monkeypatch):
+    monkeypatch.setenv("IVY_LLM_MAX_RETRIES", "4")
+    monkeypatch.setenv("IVY_LLM_RETRY_BASE_DELAY", "0.25")
+    monkeypatch.setenv("IVY_FALLBACK_MODEL", "anthropic/claude-sonnet-4-5")
+    monkeypatch.setenv("IVY_AUTO_COMPACT_THRESHOLD", "0.75")
+
+    cfg = load_config()
+    assert cfg.llm_max_retries == 4
+    assert cfg.llm_retry_base_delay == 0.25
+    assert cfg.fallback_model == "anthropic/claude-sonnet-4-5"
+    assert cfg.auto_compact_threshold == 0.75

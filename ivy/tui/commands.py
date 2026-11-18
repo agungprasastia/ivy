@@ -43,6 +43,7 @@ from ivy.tui.views import (
     render_history_view,
     render_mcp_table,
     render_memory_results,
+    render_processes_table,
     render_profile_table,
     render_sessions_table,
     render_skills_table,
@@ -472,6 +473,39 @@ class SlashCommandMixin:
             self.console.print(f"[dim]Registered {len(loaded)} MCP tool(s).[/dim]")
             return
         render_mcp_table(self.console, self.mcp_manager.list_servers(), theme=self.theme)
+
+    async def _handle_ps(self, args: list[str]) -> None:
+        mgr = self._discover_process_manager()
+        if mgr is None:
+            self.console.print(f"[{self.theme.ui_warn}]Background process manager is not available.[/]")
+            return
+        action = args[0].lower() if args else "list"
+        if action in ("log", "poll", "logs") and len(args) >= 2:
+            ok, msg = mgr.read_output(args[1])
+            if not ok:
+                self.console.print(f"[{self.theme.ui_error}]{rich_escape(msg)}[/]")
+                return
+            self.console.print(
+                RichPanel(
+                    rich_escape(msg),
+                    title=f"[bold {self.theme.ui_label}]Process Output[/]",
+                    border_style=self.theme.banner_dim,
+                    box=rich_box.ROUNDED,
+                    expand=False,
+                )
+            )
+            return
+        if action in ("stop", "kill") and len(args) >= 2:
+            target = args[1]
+            if target.lower() == "all":
+                await mgr.shutdown_all()
+                self.console.print(f"[{self.theme.ui_ok}]Stopped all background processes.[/]")
+                return
+            ok, msg = await mgr.stop(target)
+            style = self.theme.ui_ok if ok else self.theme.ui_error
+            self.console.print(f"[{style}]{rich_escape(msg)}[/]")
+            return
+        render_processes_table(self.console, mgr.list_processes(), theme=self.theme)
 
     async def _handle_cron_command(self, raw_line: str, args: list[str]) -> None:
         action = args[0].lower() if args else "list"
@@ -1160,6 +1194,10 @@ class SlashCommandMixin:
 
         if cmd == "/mcp":
             await self._handle_mcp(args)
+            return True
+
+        if cmd == "/ps":
+            await self._handle_ps(args)
             return True
 
         if cmd == "/gateway":

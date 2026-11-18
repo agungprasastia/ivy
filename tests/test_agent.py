@@ -426,3 +426,67 @@ def test_redact_secrets_scrubs_keys_and_tokens():
     )
     assert "sk-proj-1234567890abcdefghij123456" not in formatted
     assert "tok_super_secret_bearer_12345" not in formatted
+
+
+@pytest.mark.asyncio
+async def test_agent_auto_compacts_when_token_budget_exceeded(tmp_path):
+    from ivy.config import IvyConfig
+
+    store = MemoryStore(db_path=str(tmp_path / "compact.db"))
+    await store.initialize()
+    for i in range(12):
+        await store.save_message("s1", ChatMessage(role=Role.USER, content=f"msg {i} " + ("a" * 6000)))
+        await store.save_message("s1", ChatMessage(role=Role.ASSISTANT, content=f"ans {i} " + ("b" * 6000)))
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        side_effect=[
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="Summary of earlier work.",
+                metadata={"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+            ),
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="Final answer after compact.",
+                metadata={"usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}},
+            ),
+        ]
+    )
+
+    cfg = IvyConfig(db_path=str(tmp_path / "compact.db"), auto_compact_threshold=0.1)
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=ToolRegistry(), memory_store=store, config=cfg)
+    reply = await agent.run_turn("What next?", session_id="s1")
+
+    assert reply.content == "Final answer after compact."
+    assert reply.metadata.get("auto_compacted", {}).get("removed_messages", 0) > 0
+    assert reply.metadata["turn_usage"]["api_calls"] == 2
+    assert reply.metadata["turn_usage"]["total_tokens"] == 180
+    sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
+    assert sent_messages[0].role == Role.SYSTEM
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_auto_compaction_fallback_when_llm_fails():
+    from ivy.config import IvyConfig
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        side_effect=[
+            RuntimeError("compaction llm unavailable"),
+            ChatMessage(role=Role.ASSISTANT, content="Still answered."),
+        ]
+    )
+    cfg = IvyConfig(auto_compact_threshold=0.1)
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=ToolRegistry(), config=cfg)
+    for i in range(12):
+        agent._in_memory_sessions["s_err"].append(
+            ChatMessage(role=Role.USER, content=f"q{i} " + ("z" * 6000))
+        )
+    reply = await agent.run_turn("Continue", session_id="s_err")
+    assert reply.content == "Still answered."
+    sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
+    assert sent_messages[0].role == Role.SYSTEM

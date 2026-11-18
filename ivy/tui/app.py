@@ -37,6 +37,7 @@ from ivy.tools.cron_tool import CronManageTool
 from ivy.tools.delegate import DelegateTaskTool
 from ivy.tools.files import FileTools
 from ivy.tools.mcp import MCPManager
+from ivy.tools.process_registry import BackgroundProcessManager, ProcessManageTool
 from ivy.tools.profile import RememberPreferenceTool
 from ivy.tools.registry import ToolRegistry
 from ivy.tools.runner import CodeRunnerTool
@@ -145,6 +146,7 @@ def build_default_tool_registry(
     cron_scheduler: CronScheduler | None = None,
     session_id_getter: Callable[[], str] | None = None,
     clarify_callback: Callable[[str, list[str], bool], Any] | None = None,
+    process_manager: BackgroundProcessManager | None = None,
 ) -> ToolRegistry:
     """Create and populate the default ToolRegistry."""
     registry = ToolRegistry()
@@ -154,7 +156,9 @@ def build_default_tool_registry(
         unattended=unattended,
         approval_callback=approval_callback,
     )
-    registry.register(TerminalTool(approval_policy=policy))
+    registry.register(TerminalTool(approval_policy=policy, process_manager=process_manager))
+    if process_manager is not None:
+        registry.register(ProcessManageTool(manager=process_manager))
     FileTools(
         checkpoint_store=checkpoint_store,
         session_id_getter=session_id_getter,
@@ -206,6 +210,7 @@ class IvyCLIApp(SlashCommandMixin):
         env_path: str | Path | None = None,
         approval_policy: SafetyApprovalPolicy | None = None,
         history_path: str | Path | None = None,
+        process_manager: BackgroundProcessManager | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
@@ -225,6 +230,7 @@ class IvyCLIApp(SlashCommandMixin):
         self.todo_store: TodoStore = self._discover_todo_store() or TodoStore()
         self.checkpoint_store: FileCheckpointStore = self._discover_checkpoint_store() or FileCheckpointStore()
         self.mcp_manager: MCPManager = MCPManager()
+        self._process_manager: BackgroundProcessManager | None = process_manager
         self._active_status: Any = None
         self._prompt_session: Any = None
         self._session_title: str | None = None
@@ -265,6 +271,23 @@ class IvyCLIApp(SlashCommandMixin):
             pf = registry.get("patch_file")
             cp2 = getattr(pf, "checkpoint_store", None)
             return cp2 if isinstance(cp2, FileCheckpointStore) else None
+        except Exception:
+            return None
+
+    def _discover_process_manager(self) -> BackgroundProcessManager | None:
+        if self._process_manager is not None:
+            return self._process_manager
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get"):
+            return None
+        try:
+            proc_tool = registry.get("process")
+            mgr = getattr(proc_tool, "manager", None)
+            if isinstance(mgr, BackgroundProcessManager):
+                return mgr
+            term = registry.get("terminal")
+            mgr2 = getattr(term, "process_manager", None)
+            return mgr2 if isinstance(mgr2, BackgroundProcessManager) else None
         except Exception:
             return None
 
@@ -773,6 +796,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         )
         todo_store = TodoStore()
         checkpoint_store = FileCheckpointStore()
+        cli_process_manager = BackgroundProcessManager()
         target_session = args.session
         if getattr(args, "continue_latest", False) and target_session == "cli:main":
             latest = await store.get_latest_session_id()
@@ -791,6 +815,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             todo_store=todo_store,
             checkpoint_store=checkpoint_store,
             session_id_getter=lambda: session_holder["id"],
+            process_manager=cli_process_manager,
         )
         agent = IvyAgent(
             llm_client=llm,
@@ -822,6 +847,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             env_path=".env",
             approval_policy=cli_policy,
             history_path=Path.home() / ".ivy" / "history",
+            process_manager=cli_process_manager,
         )
         app.todo_store = todo_store
         app.checkpoint_store = checkpoint_store
@@ -848,6 +874,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             await app.run_interactive()
             return 0
         finally:
+            await cli_process_manager.shutdown_all()
             await app.mcp_manager.close_all()
     finally:
         await llm.close()

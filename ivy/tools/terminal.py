@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import platform
-import subprocess
 from typing import Any
 
 from ivy.core.types import ToolResult
 from ivy.tools.approval import SafetyApprovalPolicy
 from ivy.tools.base import BaseTool
+from ivy.tools.process_registry import (
+    BackgroundProcessManager,
+    build_shell_command,
+    spawn_shell_kwargs,
+)
 from ivy.tools.runner import terminate_process_tree
 
 
 class TerminalTool(BaseTool):
-    """Executes shell commands with safety intercept and timeout protection."""
+    """Executes shell commands with safety intercept, timeout, and optional background mode."""
 
     name = "terminal"
     description = (
         "Execute shell commands in the operating system terminal "
-        "(PowerShell on Windows, Bash on Linux/macOS)."
+        "(PowerShell on Windows, Bash on Linux/macOS). Set background=true for long-running servers."
     )
     parameters = {
         "type": "object",
@@ -32,6 +35,11 @@ class TerminalTool(BaseTool):
                 "type": "string",
                 "description": "Optional working directory path where the command executes.",
             },
+            "background": {
+                "type": "boolean",
+                "description": "Start command in the background and return a process_id immediately.",
+                "default": False,
+            },
         },
         "required": ["command"],
     }
@@ -40,14 +48,17 @@ class TerminalTool(BaseTool):
         self,
         approval_policy: SafetyApprovalPolicy | None = None,
         timeout: float = 60.0,
+        process_manager: BackgroundProcessManager | None = None,
     ) -> None:
         self.approval_policy = approval_policy or SafetyApprovalPolicy()
         self.timeout = timeout
+        self.process_manager = process_manager
 
     async def execute(
         self,
         command: str,
         working_dir: str | None = None,
+        background: bool = False,
         **kwargs: Any,
     ) -> ToolResult:
         """Run the command after safety approval."""
@@ -65,31 +76,38 @@ class TerminalTool(BaseTool):
                 output=reason if feedback else "Command execution rejected by user/safety policy",
             )
 
-        if platform.system() == "Windows":
-            shell_cmd = [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ]
-        else:
-            shell_cmd = ["/bin/bash", "-c", command]
+        if background:
+            if self.process_manager is None:
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error="Background process manager is not configured.",
+                    output="",
+                )
+            try:
+                bp = await self.process_manager.spawn(command=command, working_dir=working_dir)
+                return ToolResult(
+                    tool_name=self.name,
+                    status="success",
+                    output=(
+                        f"Started background process {bp.process_id} (pid={bp.pid}). "
+                        "Use the `process` tool with action='poll'|'write'|'kill' to manage it."
+                    ),
+                    metadata={"process_id": bp.process_id, "pid": bp.pid, "background": True},
+                )
+            except Exception as exc:
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=f"Failed to start background process: {exc}",
+                    output="",
+                )
+
+        shell_cmd = build_shell_command(command)
 
         proc: asyncio.subprocess.Process | None = None
         try:
-            exec_kwargs: dict[str, Any] = {
-                "stdout": asyncio.subprocess.PIPE,
-                "stderr": asyncio.subprocess.PIPE,
-                "cwd": working_dir,
-            }
-            if platform.system() == "Windows":
-                exec_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                exec_kwargs["start_new_session"] = True
-
+            exec_kwargs = spawn_shell_kwargs(working_dir=working_dir, with_stdin=False)
             proc = await asyncio.create_subprocess_exec(*shell_cmd, **exec_kwargs)
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(

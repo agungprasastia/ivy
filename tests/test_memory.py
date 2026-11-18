@@ -159,3 +159,45 @@ async def test_memory_store_title_undo_fork_and_context_compaction(tmp_path):
     assert "cli:empty_new" not in {s["session_id"] for s in await store.list_sessions()}
 
     await store.close()
+
+
+def test_should_auto_compact_threshold_and_tail_safety():
+    from ivy.memory.context import should_auto_compact
+
+    short_msgs = [ChatMessage(role=Role.USER, content="hello")] * 4
+    assert should_auto_compact(short_msgs, model="gpt-4o", threshold=0.85) is False
+
+    # 128_000 window for gpt-4o -> ~115_000 tokens (~90%)
+    heavy = [ChatMessage(role=Role.USER, content="x" * 46_000) for _ in range(10)]
+    assert should_auto_compact(heavy, model="gpt-4o", threshold=0.85) is True
+
+
+@pytest.mark.asyncio
+async def test_compact_with_llm_includes_tool_calls_and_usage():
+    from unittest.mock import AsyncMock, MagicMock
+    from ivy.core.types import ToolCall
+
+    mock_llm = MagicMock()
+    mock_llm.chat_completion = AsyncMock(
+        return_value=ChatMessage(
+            role=Role.ASSISTANT,
+            content="- Wrote src/app.py",
+            metadata={"usage": {"prompt_tokens": 90, "completion_tokens": 15, "total_tokens": 105}},
+        )
+    )
+    msgs = [
+        ChatMessage(role=Role.USER, content="Edit src/app.py"),
+        ChatMessage(
+            role=Role.ASSISTANT,
+            content=None,
+            tool_calls=[ToolCall(id="c1", function_name="write_file", arguments={"path": "src/app.py"})],
+        ),
+        ChatMessage(role=Role.TOOL, name="write_file", tool_call_id="c1", content="written"),
+        ChatMessage(role=Role.USER, content="Now test it"),
+        ChatMessage(role=Role.ASSISTANT, content="Done"),
+    ]
+    _, stats = await ContextWindowManager().compact_with_llm(msgs, llm_client=mock_llm, keep_recent=2)
+    prompt_sent = mock_llm.chat_completion.call_args.kwargs["messages"][1].content
+    assert "write_file" in prompt_sent
+    assert "src/app.py" in prompt_sent
+    assert stats.get("compaction_usage", {}).get("total_tokens") == 105

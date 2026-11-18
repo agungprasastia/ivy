@@ -7,7 +7,7 @@ import platform as _platform
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ivy.core.types import ToolResult
 
@@ -151,6 +151,7 @@ def load_project_context_files(cwd: str | Path | None = None) -> str:
 def build_system_prompt(
     skill_engine: SkillEngine | None = None,
     user_profile: dict[str, str] | None = None,
+    memory_notes: Sequence[dict[str, Any]] | None = None,
     extra_instructions: str | None = None,
     model: str | None = None,
     platform: str | None = None,
@@ -192,6 +193,23 @@ def build_system_prompt(
         for k, v in sorted(user_profile.items()):
             profile_lines.append(f"- {k}: {v}")
         sections.append("\n".join(profile_lines))
+
+    if memory_notes:
+        mem_lines = ["# Curated Memory"]
+        budget = 2500
+        used = 0
+        for item in memory_notes:
+            note_text = str(item.get("note", "")).strip()
+            if not note_text:
+                continue
+            cat = str(item.get("category", "general")).strip() or "general"
+            line = f"- [{cat}] {note_text}"
+            if used + len(line) > budget:
+                break
+            mem_lines.append(line)
+            used += len(line) + 1
+        if len(mem_lines) > 1:
+            sections.append("\n".join(mem_lines))
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     runtime_lines = [

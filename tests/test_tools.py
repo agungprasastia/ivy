@@ -912,3 +912,36 @@ async def test_skill_manager_blocks_unsafe_skill_create_and_update(tmp_path):
     preserved = engine.inspect_skill("safe-tool")
     assert preserved is not None
     assert "Check git status" in preserved.instructions
+
+
+@pytest.mark.asyncio
+async def test_memory_note_tool_crud(tmp_path):
+    from ivy.config import IvyConfig
+    from ivy.memory.store import MemoryStore
+    from ivy.tools.memory_note import MemoryNoteTool
+    from ivy.tui.app import build_default_tool_registry
+
+    store = MemoryStore(db_path=str(tmp_path / "mem_tool.db"))
+    await store.initialize()
+    tool = MemoryNoteTool(memory_store=store)
+
+    empty_err = await tool.execute(action="add", note="   ")
+    assert empty_err.status == "error"
+
+    res_add = await tool.execute(action="add", note="Run tests via .venv\\Scripts\\pytest.exe", category="workflow")
+    assert res_add.status == "success"
+
+    res_list = await tool.execute(action="list")
+    assert res_list.status == "success" and "pytest.exe" in res_list.output
+
+    res_search = await tool.execute(action="search", query="workflow")
+    assert res_search.status == "success" and "pytest.exe" in res_search.output
+
+    notes = await store.list_memory_notes()
+    res_rm = await tool.execute(action="remove", note_id=notes[0]["id"])
+    assert res_rm.status == "success"
+    assert await store.list_memory_notes() == []
+
+    reg = build_default_tool_registry(config=IvyConfig(), interactive=False, memory_store=store)
+    assert "memory_note" in {s["function"]["name"] for s in reg.get_schemas()}
+    await store.close()

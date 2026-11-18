@@ -37,6 +37,7 @@ from ivy.tools.cron_tool import CronManageTool
 from ivy.tools.delegate import DelegateTaskTool
 from ivy.tools.files import FileTools
 from ivy.tools.mcp import MCPManager
+from ivy.tools.memory_note import MemoryNoteTool
 from ivy.tools.process_registry import BackgroundProcessManager, ProcessManageTool
 from ivy.tools.profile import RememberPreferenceTool
 from ivy.tools.registry import ToolRegistry
@@ -174,6 +175,7 @@ def build_default_tool_registry(
         registry.register(ClarifyTool(clarify_callback=clarify_callback))
     if memory_store is not None:
         registry.register(RememberPreferenceTool(memory_store=memory_store))
+        registry.register(MemoryNoteTool(memory_store=memory_store))
         registry.register(SessionSearchTool(memory_store=memory_store))
     if skill_engine is not None:
         registry.register(ReadSkillTool(skill_engine=skill_engine))

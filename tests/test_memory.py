@@ -201,3 +201,33 @@ async def test_compact_with_llm_includes_tool_calls_and_usage():
     assert "write_file" in prompt_sent
     assert "src/app.py" in prompt_sent
     assert stats.get("compaction_usage", {}).get("total_tokens") == 105
+
+
+@pytest.mark.asyncio
+async def test_memory_store_curated_notes_crud_redaction_and_limit(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "notes.db"))
+    await store.initialize()
+
+    added = await store.add_memory_note(
+        "Deploy token sk-1234567890abcdefghijklmnop stays in .env", category="ops"
+    )
+    assert added["id"] >= 1
+    assert added["category"] == "ops"
+    assert "sk-1234567890" not in added["note"]
+
+    notes = await store.list_memory_notes()
+    assert len(notes) == 1
+    assert notes[0]["category"] == "ops"
+
+    hits = await store.search_memory_notes("Deploy")
+    assert len(hits) == 1
+
+    assert await store.remove_memory_note(added["id"]) is True
+    assert await store.list_memory_notes() == []
+
+    for idx in range(50):
+        await store.add_memory_note(f"Stable project invariant #{idx}", category="arch")
+    with pytest.raises(ValueError, match="limit"):
+        await store.add_memory_note("Note #51 overflows", category="arch")
+
+    await store.close()

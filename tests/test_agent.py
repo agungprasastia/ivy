@@ -490,3 +490,24 @@ async def test_agent_auto_compaction_fallback_when_llm_fails():
     assert reply.content == "Still answered."
     sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
     assert sent_messages[0].role == Role.SYSTEM
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_curated_memory_notes_into_system_prompt(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "curated.db"))
+    await store.initialize()
+    await store.add_memory_note("Use uvx ruff check before commit", category="workflow")
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        return_value=ChatMessage(role=Role.ASSISTANT, content="Got it.")
+    )
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=ToolRegistry(), memory_store=store)
+    await agent.run_turn("Remind me our workflow check?", session_id="s-mem")
+
+    sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
+    assert sent_messages[0].role == Role.SYSTEM
+    assert "# Curated Memory" in sent_messages[0].content
+    assert "Use uvx ruff check before commit" in sent_messages[0].content
+    await store.close()

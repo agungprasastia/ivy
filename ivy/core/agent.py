@@ -169,8 +169,10 @@ class IvyAgent:
     ) -> ChatMessage:
         """Execute one full user turn through the ReAct loop."""
         user_profile: dict[str, str] | None = None
+        memory_notes: list[dict[str, Any]] | None = None
         if self.memory_store is not None:
             user_profile = await self.memory_store.get_user_profile()
+            memory_notes = await self.memory_store.list_memory_notes(limit=50)
 
         raw_model = getattr(self.llm_client, "model", None)
         model_name = raw_model if isinstance(raw_model, str) else None
@@ -178,6 +180,7 @@ class IvyAgent:
         system_prompt = build_system_prompt(
             skill_engine=self.skill_engine,
             user_profile=user_profile,
+            memory_notes=memory_notes,
             extra_instructions=self.extra_system_instructions,
             model=model_name,
             platform=platform,

@@ -15,6 +15,7 @@ _METADATA_HOSTS = frozenset(
         "169.254.170.2",
         "169.254.169.253",
         "100.100.100.200",
+        "fd00:ec2::254",
     }
 )
 _METADATA_IPS = frozenset(
@@ -23,6 +24,7 @@ _METADATA_IPS = frozenset(
         ipaddress.ip_address("169.254.170.2"),
         ipaddress.ip_address("169.254.169.253"),
         ipaddress.ip_address("100.100.100.200"),
+        ipaddress.ip_address("fd00:ec2::254"),
     }
 )
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -111,13 +113,18 @@ def validate_url_target(
     if not resolved_ips:
         return False, f"DNS resolution returned no addresses for '{raw_host}'."
 
+    checked_any = False
     for ip_str in dict.fromkeys(resolved_ips):
         try:
             ip_obj = ipaddress.ip_address(ip_str)
         except ValueError:
             continue
+        checked_any = True
         reason = _check_ip_address(ip_obj, allow_private=allow_private)
         if reason is not None:
             return False, f"{reason} (resolved from {raw_host})"
+
+    if not checked_any:
+        return False, f"DNS resolution returned no valid IP addresses for '{raw_host}'."
 
     return True, ""

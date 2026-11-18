@@ -55,7 +55,7 @@ class MemoryNoteTool(BaseTool):
         self,
         action: str,
         note: str | None = None,
-        category: str = "general",
+        category: str | None = None,
         query: str | None = None,
         note_id: int | None = None,
         **kwargs: Any,
@@ -69,7 +69,9 @@ class MemoryNoteTool(BaseTool):
                     error="'note' is required for action 'add'.",
                 )
             try:
-                saved = await self.memory_store.add_memory_note(note, category=category)
+                saved = await self.memory_store.add_memory_note(
+                    note, category=(category or "general")
+                )
             except ValueError as exc:
                 return ToolResult(tool_name=self.name, status="error", error=str(exc))
             return ToolResult(
@@ -80,7 +82,7 @@ class MemoryNoteTool(BaseTool):
 
         if act == "list":
             rows = await self.memory_store.list_memory_notes(
-                category=category if category and category != "general" else None
+                category=category.strip() if category and category.strip() else None
             )
             if not rows:
                 return ToolResult(
@@ -115,17 +117,25 @@ class MemoryNoteTool(BaseTool):
                     status="error",
                     error="'note_id' is required for action 'remove'.",
                 )
-            removed = await self.memory_store.remove_memory_note(note_id)
+            try:
+                parsed_id = int(note_id)
+            except (TypeError, ValueError):
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=f"Invalid 'note_id': {note_id}",
+                )
+            removed = await self.memory_store.remove_memory_note(parsed_id)
             if not removed:
                 return ToolResult(
                     tool_name=self.name,
                     status="error",
-                    error=f"Memory note #{note_id} not found.",
+                    error=f"Memory note #{parsed_id} not found.",
                 )
             return ToolResult(
                 tool_name=self.name,
                 status="success",
-                output=f"Removed memory note #{note_id}.",
+                output=f"Removed memory note #{parsed_id}.",
             )
 
         return ToolResult(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from html.parser import HTMLParser
@@ -78,12 +79,15 @@ class WebFetchTool(BaseTool):
         self.max_redirects = max(0, max_redirects)
 
     async def execute(self, url: str, max_chars: int = 8000, **kwargs: Any) -> ToolResult:
-        ok, err = validate_url_target(url, allow_private=self.allow_private_urls)
+        clean_url = (url or "").strip()
+        ok, err = await asyncio.to_thread(
+            validate_url_target, clean_url, allow_private=self.allow_private_urls
+        )
         if not ok:
             return ToolResult(tool_name=self.name, status="error", error=err)
 
         try:
-            current_url = url
+            current_url = clean_url
             resp: Any = None
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
                 for hop in range(self.max_redirects + 1):
@@ -99,8 +103,10 @@ class WebFetchTool(BaseTool):
                                 error=f"Too many redirects (max {self.max_redirects})",
                             )
                         next_url = urljoin(current_url, str(location))
-                        redir_ok, redir_err = validate_url_target(
-                            next_url, allow_private=self.allow_private_urls
+                        redir_ok, redir_err = await asyncio.to_thread(
+                            validate_url_target,
+                            next_url,
+                            allow_private=self.allow_private_urls,
                         )
                         if not redir_ok:
                             return ToolResult(tool_name=self.name, status="error", error=redir_err)

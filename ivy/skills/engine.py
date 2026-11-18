@@ -13,6 +13,7 @@ from ivy.skills.format import (
     parse_skill_markdown,
     serialize_skill_markdown,
 )
+from ivy.skills.guard import format_scan_rejection, scan_skill_content
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,19 @@ class SkillEngine:
             try:
                 raw = skill_file.read_text(encoding="utf-8")
                 skill = parse_skill_markdown(raw)
+                scan = scan_skill_content(
+                    skill.name,
+                    skill.description,
+                    skill.instructions,
+                    metadata=skill.metadata,
+                )
+                if not scan.safe:
+                    logger.warning(
+                        "Skipping unsafe SKILL.md at %s: %s",
+                        skill_file,
+                        format_scan_rejection(scan),
+                    )
+                    continue
                 skill.path = str(skill_file)
                 self._skills[skill.name] = skill
             except Exception as exc:

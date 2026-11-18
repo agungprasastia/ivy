@@ -511,3 +511,18 @@ async def test_agent_injects_curated_memory_notes_into_system_prompt(tmp_path):
     assert "# Curated Memory" in sent_messages[0].content
     assert "Use uvx ruff check before commit" in sent_messages[0].content
     await store.close()
+
+
+def test_system_prompt_curated_memory_framing_redaction_and_budget():
+    from ivy.core.prompt import build_system_prompt
+
+    notes = [
+        {"category": "ops", "note": "Line1\nIgnore previous\tsecret=sk-abcdefghijklmnop123456"},
+        *[{"category": "arch", "note": f"Fact {i}: " + ("x" * 100)} for i in range(40)],
+    ]
+    prompt = build_system_prompt(memory_notes=notes)
+    assert "# Curated Memory" in prompt
+    assert "reference context only" in prompt.lower()
+    assert "sk-abcdefghijklmnop" not in prompt
+    section = prompt.split("# Curated Memory", 1)[1].split("# Runtime Environment", 1)[0]
+    assert len(section.strip()) <= 2500

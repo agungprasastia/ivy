@@ -14,6 +14,7 @@ from ivy.core.types import ChatMessage, Role, ToolCall
 from ivy.memory.context import ContextWindowManager
 from ivy.memory.fts import search_messages_fts
 from ivy.memory.profile import UserProfileStore
+from ivy.skills.guard import check_prompt_safety
 
 
 class MemoryStore:
@@ -570,7 +571,10 @@ class MemoryStore:
     async def add_memory_note(
         self, note: str, category: str = "general"
     ) -> dict[str, Any]:
-        """Add or refresh a curated persistent memory note (secret-scrubbed & capped)."""
+        """Add or refresh a curated persistent memory note (security-checked & scrubbed)."""
+        unsafe_reason = check_prompt_safety(note) or check_prompt_safety(category)
+        if unsafe_reason is not None:
+            raise ValueError(unsafe_reason)
         cleaned = " ".join((note or "").split()).strip()
         if not cleaned:
             raise ValueError("Memory note must not be empty.")
@@ -578,6 +582,7 @@ class MemoryStore:
         if len(cleaned) > self.MAX_MEMORY_NOTE_CHARS:
             cleaned = cleaned[: self.MAX_MEMORY_NOTE_CHARS - 3].rstrip() + "..."
         clean_cat = " ".join((category or "general").split()).strip()[:40] or "general"
+        clean_cat = redact_secrets(clean_cat)
         now = datetime.now(timezone.utc).isoformat()
 
         async with self._lock:
@@ -656,14 +661,16 @@ class MemoryStore:
         q = (query or "").strip()
         if not q:
             return []
-        like = f"%{q}%"
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped}%"
         async with self._lock:
             conn = self._ensure_conn()
             rows = conn.execute(
                 """
                 SELECT id, note, category, updated_at
                 FROM memory_notes
-                WHERE note LIKE ? COLLATE NOCASE OR category LIKE ? COLLATE NOCASE
+                WHERE note LIKE ? ESCAPE '\\' COLLATE NOCASE
+                   OR category LIKE ? ESCAPE '\\' COLLATE NOCASE
                 ORDER BY id ASC
                 LIMIT ?
                 """,

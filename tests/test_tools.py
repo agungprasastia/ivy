@@ -945,3 +945,98 @@ async def test_memory_note_tool_crud(tmp_path):
     reg = build_default_tool_registry(config=IvyConfig(), interactive=False, memory_store=store)
     assert "memory_note" in {s["function"]["name"] for s in reg.get_schemas()}
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_phase6_review_edge_cases(tmp_path, monkeypatch):
+    import os
+    import socket
+    from pathlib import Path
+    from ivy.memory.store import MemoryStore
+    from ivy.tools.files import PatchFileTool, SearchFilesTool, WriteFileTool
+    from ivy.tools.memory_note import MemoryNoteTool
+    from ivy.tools.path_security import is_sensitive_path
+    import ivy.tools.url_safety as url_safety
+    import ivy.tools.web as web_mod
+
+    # 1. AWS IPv6 IMDS fd00:ec2::254 blocked even when allow_private=True
+    ok_ec2_v6, _ = url_safety.validate_url_target(
+        "http://[fd00:ec2::254]/latest/meta-data/", allow_private=True
+    )
+    assert ok_ec2_v6 is False
+
+    # 2. Fail closed when require_read_before_overwrite=True without read_tracker
+    existing = tmp_path / "existing.txt"
+    existing.write_text("v1", encoding="utf-8")
+    w_no_tracker = WriteFileTool(require_read_before_overwrite=True)
+    assert (await w_no_tracker.execute(path=str(existing), content="v2")).status == "error"
+    p_no_tracker = PatchFileTool(require_read_before_overwrite=True)
+    assert (await p_no_tracker.execute(path=str(existing), target="v1", replacement="v2")).status == "error"
+
+    # 3. Windows ADS suffix stripped before sensitive check
+    if os.name == "nt":
+        assert is_sensitive_path(Path(str(tmp_path / ".env:secretstream"))) is not None
+
+    # 4. SearchFilesTool blocks symlink resolving outside workspace_root
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    secret_out = tmp_path / "outside_secret.txt"
+    secret_out.write_text("TOP_SECRET_NEEDLE", encoding="utf-8")
+    link_path = ws / "escape.txt"
+    try:
+        link_path.symlink_to(secret_out)
+        symlink_created = True
+    except OSError:
+        symlink_created = False
+    if symlink_created:
+        search_scoped = SearchFilesTool(workspace_root=ws)
+        s_res = await search_scoped.execute(pattern="TOP_SECRET_NEEDLE", path=str(ws))
+        assert "escape.txt" not in s_res.output
+
+    # 5. WebFetchTool rejects max_redirects exceeded and protocol-relative loopback redirect
+    monkeypatch.setattr(
+        url_safety.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+
+    class LoopRedirectClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            resp = type("R", (), {})()
+            if url == "https://public.example/proto":
+                resp.status_code = 302
+                resp.headers = {"Location": "//127.0.0.1/admin"}
+            else:
+                resp.status_code = 302
+                resp.headers = {"Location": "https://public.example/loop"}
+            resp.text = ""
+            resp.raise_for_status = lambda: None
+            return resp
+
+    monkeypatch.setattr(web_mod.httpx, "AsyncClient", LoopRedirectClient)
+    wf = WebFetchTool(max_redirects=2)
+    assert (await wf.execute(url="https://public.example/proto")).status == "error"
+    res_loop = await wf.execute(url="https://public.example/loop")
+    assert res_loop.status == "error" and "redirect" in (res_loop.error or "").lower()
+
+    # 6. MemoryNoteTool general category filter + invalid note_id / empty search / unknown action
+    store = MemoryStore(db_path=str(tmp_path / "mn_edge.db"))
+    await store.initialize()
+    mnt = MemoryNoteTool(memory_store=store)
+    await mnt.execute(action="add", note="General fact")
+    await mnt.execute(action="add", note="Ops fact", category="ops")
+    list_gen = await mnt.execute(action="list", category="general")
+    assert "General fact" in list_gen.output and "Ops fact" not in list_gen.output
+    assert (await mnt.execute(action="remove", note_id="bad-id")).status == "error"
+    assert (await mnt.execute(action="search", query="  ")).status == "error"
+    assert (await mnt.execute(action="unknown")).status == "error"
+    await store.close()

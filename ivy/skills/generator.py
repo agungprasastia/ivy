@@ -64,7 +64,12 @@ class SkillGenerator:
             logger.warning("Skill reflection produced malformed SKILL.md: %s", exc)
             return None
 
-        scan = scan_skill_content(skill.name, skill.description, skill.instructions)
+        scan = scan_skill_content(
+            skill.name,
+            skill.description,
+            skill.instructions,
+            metadata=skill.metadata,
+        )
         if not scan.safe:
             logger.warning("Skill reflection blocked by guard (%s): %s", skill.name, format_scan_rejection(scan))
             return None

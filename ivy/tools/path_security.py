@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 SENSITIVE_DIR_NAMES = frozenset({".ssh", ".aws", ".gnupg", ".kube"})
 SENSITIVE_FILE_NAMES = frozenset({".git-credentials", ".netrc", ".npmrc", ".pypirc"})
 SAFE_DOTENV_EXAMPLES = frozenset({".env.example", ".env.template", ".env.sample"})
+
+
+def _strip_windows_ads(segment: str) -> str:
+    """Strip NTFS Alternate Data Stream suffix (e.g. `.env:stream` -> `.env`)."""
+    if os.name == "nt" and ":" in segment:
+        base = segment.split(":", 1)[0]
+        if base:
+            return base
+    return segment
 
 
 def has_control_chars(raw: str) -> bool:
@@ -16,12 +26,12 @@ def has_control_chars(raw: str) -> bool:
 
 def is_sensitive_path(path: Path, *, allow_dotenv: bool = False) -> str | None:
     """Return a denial reason when path points to a credential or sensitive system file."""
-    lower_parts = [part.lower() for part in path.parts]
+    lower_parts = [_strip_windows_ads(part).lower() for part in path.parts]
     for part in lower_parts:
         if part in SENSITIVE_DIR_NAMES:
             return f"Access denied: sensitive directory segment '{part}' is protected."
 
-    name = path.name.lower()
+    name = _strip_windows_ads(path.name).lower()
     if name in SENSITIVE_FILE_NAMES:
         return f"Access denied: sensitive credential file '{path.name}' is protected."
 

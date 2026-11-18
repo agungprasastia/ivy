@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
-_INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+_INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff\U000e0000-\U000e007f]")
 _SENSITIVE_TARGET_RE = re.compile(
-    r"(?:~/\.ssh|/\.ssh/|\.aws/credentials|/etc/shadow|\.git-credentials|\.netrc|(?<![A-Za-z0-9_])\.env(?:\.[A-Za-z0-9_-]+)?(?![A-Za-z0-9_-]))",
+    r"(?:~/\.ssh|/\.ssh/|\.aws/credentials|/etc/shadow|\.git-credentials|\.netrc|"
+    r"(?<![A-Za-z0-9_])\.env(?!\.(?:example|template|sample)(?![A-Za-z0-9_-]))(?:\.[A-Za-z0-9_-]+)?(?![A-Za-z0-9_-]))",
     re.IGNORECASE,
 )
 _NETWORK_CMD_RE = re.compile(
@@ -15,10 +17,21 @@ _NETWORK_CMD_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PROMPT_INJECTION_RE = re.compile(
+    r"\b(?:ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions|"
+    r"disregard\s+(?:all\s+)?(?:previous|prior)\s+instructions|"
+    r"bypass\s+(?:safety|security|approval)|"
+    r"do\s+not\s+tell\s+the\s+user)\b",
+    re.IGNORECASE,
+)
+
 _DANGER_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "remote_pipe_exec",
-        re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sh|bash|zsh|pwsh|powershell|python\d?)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n|]*\|\s*(?:sh|bash|zsh|pwsh|powershell|python\d?|iex|Invoke-Expression)\b",
+            re.IGNORECASE,
+        ),
         "Remote download piped directly to a shell/interpreter",
     ),
     (
@@ -38,13 +51,7 @@ _DANGER_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "prompt_injection_override",
-        re.compile(
-            r"\b(?:ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions|"
-            r"disregard\s+(?:all\s+)?(?:previous|prior)\s+instructions|"
-            r"bypass\s+(?:safety|security|approval)|"
-            r"do\s+not\s+tell\s+the\s+user)\b",
-            re.IGNORECASE,
-        ),
+        _PROMPT_INJECTION_RE,
         "Prompt-injection or user-deception instruction",
     ),
     (
@@ -76,9 +83,30 @@ class SkillScanResult:
     findings: list[SkillFinding] = field(default_factory=list)
 
 
-def scan_skill_content(name: str, description: str, instructions: str) -> SkillScanResult:
-    """Statically scan skill fields for RCE, exfiltration, leaked secrets, and injection."""
-    combined = f"{name}\n{description}\n{instructions}"
+def check_prompt_safety(text: str) -> str | None:
+    """Return a security error string if text hides invisible Unicode or prompt injection."""
+    if not text:
+        return None
+    if _INVISIBLE_UNICODE_RE.search(text):
+        return "Blocked by security policy: hidden invisible or bidi Unicode character detected."
+    if _PROMPT_INJECTION_RE.search(text):
+        return "Blocked by security policy: prompt-injection or override phrase detected."
+    return None
+
+
+def scan_skill_content(
+    name: str,
+    description: str,
+    instructions: str,
+    metadata: dict[str, Any] | None = None,
+) -> SkillScanResult:
+    """Statically scan skill fields and metadata for RCE, exfiltration, leaked secrets, and injection."""
+    meta_parts = (
+        [f"{k}={v}" for k, v in metadata.items()]
+        if isinstance(metadata, dict)
+        else []
+    )
+    combined = "\n".join([name, description, instructions, *meta_parts])
     findings: list[SkillFinding] = []
 
     uni_match = _INVISIBLE_UNICODE_RE.search(combined)

@@ -21,6 +21,7 @@ from ivy.tui.theme import IVY_ASCII_LOGO, IVY_HERO_ART, ThemeConfig, get_theme
 
 _TOOL_GROUPS: dict[str, str] = {
     "terminal": "terminal",
+    "process": "terminal",
     "read_file": "files",
     "write_file": "files",
     "list_directory": "files",
@@ -35,6 +36,7 @@ _TOOL_GROUPS: dict[str, str] = {
     "clarify": "planning",
     "delegate_task": "agents",
     "remember_preference": "memory",
+    "memory_note": "memory",
     "session_search": "memory",
     "cron_manage": "automation",
 }

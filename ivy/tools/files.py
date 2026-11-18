@@ -181,8 +181,7 @@ class WriteFileTool(BaseTool):
             if (
                 existed_before
                 and self.require_read_before_overwrite
-                and self.read_tracker is not None
-                and file_path not in self.read_tracker
+                and (self.read_tracker is None or file_path not in self.read_tracker)
             ):
                 return ToolResult(
                     tool_name=self.name,
@@ -352,8 +351,7 @@ class PatchFileTool(BaseTool):
             )
         if (
             self.require_read_before_overwrite
-            and self.read_tracker is not None
-            and file_path not in self.read_tracker
+            and (self.read_tracker is None or file_path not in self.read_tracker)
         ):
             return ToolResult(
                 tool_name=self.name,
@@ -473,7 +471,17 @@ class SearchFilesTool(BaseTool):
                 ]
                 for filename in sorted(filenames):
                     file_path = Path(dirpath) / filename
-                    if should_skip_sensitive_entry(file_path):
+                    try:
+                        resolved_file = file_path.resolve()
+                    except OSError:
+                        continue
+                    if self.workspace_root is not None and not resolved_file.is_relative_to(
+                        self.workspace_root
+                    ):
+                        continue
+                    if should_skip_sensitive_entry(file_path) or should_skip_sensitive_entry(
+                        resolved_file
+                    ):
                         continue
                     try:
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:

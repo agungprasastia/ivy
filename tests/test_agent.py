@@ -289,3 +289,49 @@ def test_system_prompt_marks_workspace_authoritative_over_upstream_proxies():
     prompt = build_system_prompt(model="oc/deepseek-v4.1-flash-free")
     assert "Authoritative" in prompt or "authoritative" in prompt
     assert "router" in prompt.lower() or "proxy" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_agent_requests_graceful_summary_when_max_iterations_reached(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "maxiter.db"))
+    await store.initialize()
+
+    class PingTool(BaseTool):
+        name = "ping_tool"
+        description = "Ping"
+        parameters = {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs):
+            return ToolResult(tool_name=self.name, status="success", output="pong")
+
+    reg = ToolRegistry()
+    reg.register(PingTool())
+
+    calls = []
+
+    async def fake_completion(messages, tools=None, stream=False):
+        calls.append({"tools": tools})
+        if tools:
+            return ChatMessage(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[ToolCall(id=f"c{len(calls)}", function_name="ping_tool", arguments={})],
+            )
+        return ChatMessage(role=Role.ASSISTANT, content="Completed pings and summarized.")
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(side_effect=fake_completion)
+
+    agent = IvyAgent(
+        llm_client=mock_llm,
+        tool_registry=reg,
+        memory_store=store,
+        max_iterations=2,
+    )
+    reply = await agent.run_turn("Do pings", session_id="cli:budget")
+    assert reply.content == "Completed pings and summarized."
+    assert len(calls) == 3
+    assert calls[2]["tools"] is None
+    assert reply.metadata["tool_calls_count"] == 2
+    await store.close()

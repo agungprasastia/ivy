@@ -39,8 +39,8 @@ class IvyAgent:
         self.skill_engine = skill_engine
         self.skill_generator = skill_generator
         self.config = config
-        self.max_iterations = max_iterations or (
-            config.max_iterations if config else 15
+        self.max_iterations = max_iterations if max_iterations is not None else (
+            config.max_iterations if config else 50
         )
         self.exclude_from_fts = exclude_from_fts
         self.extra_system_instructions = extra_system_instructions
@@ -64,6 +64,40 @@ class IvyAgent:
             )
         else:
             self._in_memory_sessions[session_id].append(message)
+
+    async def _call_model(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        stream: bool,
+        stream_callback: Callable[[str], Any | Awaitable[Any]] | None,
+    ) -> tuple[ChatMessage, bool]:
+        """Invoke LLM with streaming when enabled, returning (reply, did_stream)."""
+        if stream and isinstance(self.llm_client, LLMClient):
+            reply = await self.llm_client.stream_turn(
+                messages=messages,
+                tools=tools,
+                on_token=stream_callback,
+            )
+            return reply, True
+        reply = await self.llm_client.chat_completion(
+            messages=messages,
+            tools=tools,
+            stream=False,
+        )
+        if not isinstance(reply, ChatMessage):
+            text = "".join([chunk async for chunk in reply])
+            reply = ChatMessage(role=Role.ASSISTANT, content=text)
+        return reply, False
+
+    @staticmethod
+    def _accumulate_usage(turn_usage: dict[str, int], reply: ChatMessage) -> None:
+        turn_usage["api_calls"] += 1
+        msg_usage = reply.metadata.get("usage") if isinstance(reply.metadata, dict) else None
+        if isinstance(msg_usage, dict):
+            turn_usage["prompt_tokens"] += int(msg_usage.get("prompt_tokens", 0) or 0)
+            turn_usage["completion_tokens"] += int(msg_usage.get("completion_tokens", 0) or 0)
+            turn_usage["total_tokens"] += int(msg_usage.get("total_tokens", 0) or 0)
 
     async def _emit(
         self, callback: Callable[[Any], Any] | None, payload: Any
@@ -121,30 +155,13 @@ class IvyAgent:
         tool_calls_count = 0
 
         for _ in range(self.max_iterations):
-            did_stream = False
-            if stream and isinstance(self.llm_client, LLMClient):
-                did_stream = True
-                reply = await self.llm_client.stream_turn(
-                    messages=messages,
-                    tools=schemas,
-                    on_token=stream_callback,
-                )
-            else:
-                reply = await self.llm_client.chat_completion(
-                    messages=messages,
-                    tools=schemas,
-                    stream=False,
-                )
-                if not isinstance(reply, ChatMessage):
-                    text = "".join([chunk async for chunk in reply])
-                    reply = ChatMessage(role=Role.ASSISTANT, content=text)
-
-            turn_usage["api_calls"] += 1
-            msg_usage = reply.metadata.get("usage") if isinstance(reply.metadata, dict) else None
-            if isinstance(msg_usage, dict):
-                turn_usage["prompt_tokens"] += int(msg_usage.get("prompt_tokens", 0) or 0)
-                turn_usage["completion_tokens"] += int(msg_usage.get("completion_tokens", 0) or 0)
-                turn_usage["total_tokens"] += int(msg_usage.get("total_tokens", 0) or 0)
+            reply, did_stream = await self._call_model(
+                messages=messages,
+                tools=schemas,
+                stream=stream,
+                stream_callback=stream_callback,
+            )
+            self._accumulate_usage(turn_usage, reply)
 
             if not user_persisted:
                 await self._persist_message(session_id, user_msg, platform=platform)
@@ -204,9 +221,43 @@ class IvyAgent:
                 await self._persist_message(session_id, tool_msg, platform=platform)
                 messages.append(tool_msg)
 
+        # Graceful tool-free summary turn (Hermes pattern) when iteration budget is hit
+        if used_tools:
+            summary_nudge = ChatMessage(
+                role=Role.USER,
+                content=(
+                    "[Iteration budget reached] Without calling any more tools, provide a concise "
+                    "final summary of what was completed, files changed, checks run, and any remaining work."
+                ),
+            )
+            try:
+                summary_reply, did_stream = await self._call_model(
+                    messages=[*messages, summary_nudge],
+                    tools=None,
+                    stream=stream,
+                    stream_callback=stream_callback,
+                )
+                self._accumulate_usage(turn_usage, summary_reply)
+                if (summary_reply.content or "").strip():
+                    summary_reply.metadata = dict(summary_reply.metadata or {})
+                    summary_reply.metadata["turn_usage"] = turn_usage
+                    summary_reply.metadata["tool_calls_count"] = tool_calls_count
+                    summary_reply.metadata["context_messages"] = len(messages)
+                    await self._persist_message(session_id, summary_reply, platform=platform)
+                    if not did_stream:
+                        await self._emit(stream_callback, summary_reply.content)
+                    return summary_reply
+            except Exception:
+                pass
+
         exhausted = ChatMessage(
             role=Role.ASSISTANT,
-            content="Stopped after reaching maximum reasoning iterations without a final response.",
+            content=f"Reached maximum tool iterations ({self.max_iterations}) without a final summary.",
+            metadata={
+                "turn_usage": turn_usage,
+                "tool_calls_count": tool_calls_count,
+                "context_messages": len(messages),
+            },
         )
         await self._persist_message(session_id, exhausted, platform=platform)
         await self._emit(stream_callback, exhausted.content)

@@ -38,7 +38,7 @@ class IvyConfig(BaseModel):
     verbose: bool = False
     log_level: str = "INFO"
     default_theme: str = "ivy"
-    max_iterations: int = 15
+    max_iterations: int = 50
     subagent_max_iterations: int = 8
     code_runner_timeout: float = 30.0
 
@@ -91,6 +91,7 @@ def load_config(env_file: str | Path | None = None) -> IvyConfig:
         "verbose": ["VERBOSE"],
         "log_level": ["LOG_LEVEL"],
         "default_theme": ["IVY_THEME"],
+        "max_iterations": ["MAX_ITERATIONS", "IVY_MAX_ITERATIONS"],
     }
 
     for field, env_vars in env_map.items():

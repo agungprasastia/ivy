@@ -244,17 +244,35 @@ async def test_memory_store_security_redaction_and_wildcard_search(tmp_path):
     with pytest.raises(ValueError, match="security|injection|unicode"):
         await store.add_memory_note("Hidden\u200bpayload")
 
-    # Redacts AWS key, PEM header, and quoted env secrets
+    # Redacts AWS key, PEM full body + END delimiter, and escaped/ordinary quoted env secrets
     aws_note = await store.add_memory_note("Backup key AKIAIOSFODNN7EXAMPLE123", category="ops")
     assert "AKIAIOSFODNN7EXAMPLE" not in aws_note["note"]
-    quoted_note = await store.add_memory_note('DB_PASSWORD="supersecret123"', category="ops")
-    assert "supersecret123" not in quoted_note["note"]
-    pem_note = await store.add_memory_note("Key: -----BEGIN PRIVATE KEY-----abc", category="ops")
-    assert "BEGIN PRIVATE KEY" not in pem_note["note"]
+    quoted_note = await store.add_memory_note('DB_PASSWORD="super\\"secret123"', category="ops")
+    assert "super" not in quoted_note["note"] and "secret123" not in quoted_note["note"]
+    pem_note = await store.add_memory_note(
+        "Key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtokenbodyxyz\n-----END RSA PRIVATE KEY-----",
+        category="ops",
+    )
+    assert "BEGIN RSA PRIVATE KEY" not in pem_note["note"]
+    assert "MIIEowIBAAKCAQEAtokenbodyxyz" not in pem_note["note"]
+    assert "END RSA PRIVATE KEY" not in pem_note["note"]
 
-    # Escapes LIKE wildcards % and _
+    # Overlength note (>300 chars) rejected explicitly without truncating identity
+    with pytest.raises(ValueError, match="exceeds"):
+        await store.add_memory_note("X" * 305, category="ops")
+
+    # Category normalized + redacted + clamped, empty post-redaction falls back to general
+    cat_note = await store.add_memory_note("Cat test note", category="  team   ops  ")
+    assert cat_note["category"] == "team ops"
+    listed_cat = await store.list_memory_notes(category="team   ops")
+    assert any(n["id"] == cat_note["id"] for n in listed_cat)
+
+    # Unicode casefold search & LIKE wildcards % and _
     await store.add_memory_note("Coverage is 100% green", category="ci")
     await store.add_memory_note("Coverage is 100X green", category="ci")
+    await store.add_memory_note("Straße CI rule", category="ci")
     pct_hits = await store.search_memory_notes("100%")
     assert len(pct_hits) == 1 and "100%" in pct_hits[0]["note"]
+    uni_hits = await store.search_memory_notes("STRASSE")
+    assert len(uni_hits) == 1 and "Straße" in uni_hits[0]["note"]
     await store.close()

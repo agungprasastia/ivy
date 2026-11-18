@@ -53,28 +53,29 @@ def _check_ip_address(
     return None
 
 
-def validate_url_target(
+def resolve_and_validate_url(
     url: str,
     *,
     allow_private: bool = False,
     resolver: Callable[..., Any] | None = None,
-) -> tuple[bool, str]:
-    """Validate URL scheme, hostname, and resolved IP addresses against SSRF targets."""
+) -> tuple[bool, str, str | None, list[str]]:
+    """Validate URL scheme, port, hostname, and resolved IPs, returning approved IPs."""
     try:
         parsed = urlsplit(url.strip())
+        port_val = parsed.port
     except ValueError as exc:
-        return False, f"Invalid URL '{url}': {exc}"
+        return False, f"Invalid URL '{url}': {exc}", None, []
 
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
-        return False, "URL must start with http:// or https://"
+        return False, "URL must start with http:// or https://", None, []
 
     raw_host = (parsed.hostname or "").strip().rstrip(".").lower()
     if not raw_host:
-        return False, f"Invalid URL '{url}': missing hostname."
+        return False, f"Invalid URL '{url}': missing hostname.", None, []
 
     if raw_host in _METADATA_HOSTS:
-        return False, f"Blocked access to cloud metadata host: {raw_host}"
+        return False, f"Blocked access to cloud metadata host: {raw_host}", None, []
 
     if not allow_private and (
         raw_host == "localhost"
@@ -82,7 +83,7 @@ def validate_url_target(
         or raw_host.endswith(".local")
         or raw_host.endswith(".internal")
     ):
-        return False, f"Blocked access to private hostname: {raw_host}"
+        return False, f"Blocked access to private hostname: {raw_host}", None, []
 
     # 1. Direct IP literal check
     try:
@@ -93,16 +94,16 @@ def validate_url_target(
     if ip_literal is not None:
         reason = _check_ip_address(ip_literal, allow_private=allow_private)
         if reason is not None:
-            return False, reason
-        return True, ""
+            return False, reason, None, []
+        return True, "", raw_host, [str(_unwrap_ip(ip_literal))]
 
     # 2. DNS resolution check for domain hostnames
-    port = parsed.port or (443 if scheme == "https" else 80)
+    port = port_val or (443 if scheme == "https" else 80)
     resolve_fn = resolver or socket.getaddrinfo
     try:
         records = resolve_fn(raw_host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        return False, f"DNS resolution failed for '{raw_host}': {exc}"
+        return False, f"DNS resolution failed for '{raw_host}': {exc}", None, []
 
     resolved_ips: list[str] = []
     for rec in records:
@@ -111,20 +112,33 @@ def validate_url_target(
             resolved_ips.append(str(sockaddr[0]).split("%", 1)[0])
 
     if not resolved_ips:
-        return False, f"DNS resolution returned no addresses for '{raw_host}'."
+        return False, f"DNS resolution returned no addresses for '{raw_host}'.", None, []
 
-    checked_any = False
+    approved_ips: list[str] = []
     for ip_str in dict.fromkeys(resolved_ips):
         try:
             ip_obj = ipaddress.ip_address(ip_str)
         except ValueError:
             continue
-        checked_any = True
         reason = _check_ip_address(ip_obj, allow_private=allow_private)
         if reason is not None:
-            return False, f"{reason} (resolved from {raw_host})"
+            return False, f"{reason} (resolved from {raw_host})", None, []
+        approved_ips.append(str(_unwrap_ip(ip_obj)))
 
-    if not checked_any:
-        return False, f"DNS resolution returned no valid IP addresses for '{raw_host}'."
+    if not approved_ips:
+        return False, f"DNS resolution returned no valid IP addresses for '{raw_host}'.", None, []
 
-    return True, ""
+    return True, "", raw_host, approved_ips
+
+
+def validate_url_target(
+    url: str,
+    *,
+    allow_private: bool = False,
+    resolver: Callable[..., Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate URL scheme, hostname, and resolved IP addresses against SSRF targets."""
+    ok, reason, _host, _ips = resolve_and_validate_url(
+        url, allow_private=allow_private, resolver=resolver
+    )
+    return ok, reason

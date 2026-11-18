@@ -59,7 +59,7 @@
   - `SkillManagerTool` rejecting unsafe `create`/`update` without writing `SKILL.md` to disk,
   - `SkillGenerator.reflect_and_create()` returning `None` and not saving unsafe synthesized `SKILL.md`.
 - [ ] **Step 2:** Run pytest on those tests and confirm FAIL.
-- [ ] **Step 3 (GREEN):** Implement `ivy/skills/guard.py` and wire `scan_skill_content` into `SkillManagerTool` (`ivy/tools/skill_manager.py`) and `SkillGenerator` (`ivy/skills/generator.py`).
+- [ ] **Step 3 (GREEN):** Implement `ivy/skills/guard.py` and wire `scan_skill_content` into `SkillManagerTool` (`ivy/tools/skill_manager.py`), `SkillGenerator` (`ivy/skills/generator.py`), and `SkillEngine` (`ivy/skills/engine.py`), with a test confirming `SkillEngine.load_skills()` skips an unsafe on-disk `SKILL.md` while loading a safe one.
 - [ ] **Step 4:** Run `& ".\.venv\Scripts\pytest.exe" -p no:cacheprovider tests/test_skills.py tests/test_tools.py -v` and confirm all pass.
 - [ ] **Step 5:** Commit Task 3.
 

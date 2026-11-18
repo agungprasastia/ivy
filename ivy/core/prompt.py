@@ -241,11 +241,17 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bAIza[A-Za-z0-9_-]{25,}\b"), "AIza[REDACTED]"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "gh_[REDACTED]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}[A-Za-z0-9]*\b"), "AKIA[REDACTED]"),
-    (re.compile(r"-----BEGIN\s+(?:[A-Z0-9]+\s+)?PRIVATE\s+KEY-----"), "[PRIVATE_KEY_REDACTED]"),
+    (
+        re.compile(
+            r"-----BEGIN\s+(?:[A-Z0-9]+\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:[A-Z0-9]+\s+)?PRIVATE\s+KEY-----"
+            r"|-----BEGIN\s+(?:[A-Z0-9]+\s+)?PRIVATE\s+KEY-----"
+        ),
+        "[PRIVATE_KEY_REDACTED]",
+    ),
     (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
     (
         re.compile(
-            r"(?i)\b([A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD)\s*=\s*)(?:\"[^\"]{6,}\"|'[^']{6,}'|[^\s\"']{8,})"
+            r"(?i)\b([A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD)\s*=\s*)(?:\"(?:\\.|[^\"\\]){6,}\"|'(?:\\.|[^'\\]){6,}'|[^\s\"']{8,})"
         ),
         r"\1[REDACTED]",
     ),

@@ -117,6 +117,20 @@ class MemoryNoteTool(BaseTool):
                     status="error",
                     error="'note_id' is required for action 'remove'.",
                 )
+            if isinstance(note_id, bool) or isinstance(note_id, float):
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=f"Invalid 'note_id': {note_id!r} must be an integer.",
+                )
+            if isinstance(note_id, str):
+                stripped = note_id.strip()
+                if not stripped or not (stripped.isdigit() or (stripped[0] in "+-" and stripped[1:].isdigit())):
+                    return ToolResult(
+                        tool_name=self.name,
+                        status="error",
+                        error=f"Invalid 'note_id': {note_id!r} must be an integer.",
+                    )
             try:
                 parsed_id = int(note_id)
             except (TypeError, ValueError):

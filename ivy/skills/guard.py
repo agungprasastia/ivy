@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+VALID_SKILL_STATUSES = frozenset({"active", "draft", "disabled"})
+
 _INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff\U000e0000-\U000e007f]")
 _SENSITIVE_TARGET_RE = re.compile(
     r"(?:~/\.ssh|/\.ssh/|\.aws/credentials|/etc/shadow|\.git-credentials|\.netrc|"
@@ -46,7 +48,11 @@ _DANGER_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "destructive_disk_cmd",
-        re.compile(r"(?:\brm\s+-[rRf]{1,3}\s+(?:/|~|\$HOME)\b|\bmkfs\.[a-z0-9]+\b|\bdd\s+if=/dev/[^\s]+\s+of=/dev/[sh]d)", re.IGNORECASE),
+        re.compile(
+            r"(?:\brm\s+-[rRf]{1,3}\s+(?:/[^\s\"'`|;&]*|~(?:/[^\s\"'`|;&]*)?|\$HOME\b)|"
+            r"\bmkfs\.[a-z0-9]+\b|\bdd\s+if=/dev/[^\s]+\s+of=/dev/[sh]d)",
+            re.IGNORECASE,
+        ),
         "Destructive system wipe or raw disk overwrite command",
     ),
     (
@@ -99,6 +105,7 @@ def scan_skill_content(
     description: str,
     instructions: str,
     metadata: dict[str, Any] | None = None,
+    status: str = "active",
 ) -> SkillScanResult:
     """Statically scan skill fields and metadata for RCE, exfiltration, leaked secrets, and injection."""
     meta_parts = (
@@ -106,8 +113,19 @@ def scan_skill_content(
         if isinstance(metadata, dict)
         else []
     )
-    combined = "\n".join([name, description, instructions, *meta_parts])
+    clean_status = (status or "active").strip().lower()
+    combined = "\n".join([name, description, status or "", instructions, *meta_parts])
     findings: list[SkillFinding] = []
+
+    if clean_status not in VALID_SKILL_STATUSES:
+        findings.append(
+            SkillFinding(
+                severity="danger",
+                rule_id="invalid_status",
+                reason=f"Unsupported skill status {status!r}; expected active, draft, or disabled",
+                snippet=str(status)[:40],
+            )
+        )
 
     uni_match = _INVISIBLE_UNICODE_RE.search(combined)
     if uni_match:
@@ -132,18 +150,21 @@ def scan_skill_content(
                 )
             )
 
-    # Flag credential path access combined with outbound network command
-    sens = _SENSITIVE_TARGET_RE.search(combined)
-    net = _NETWORK_CMD_RE.search(combined)
-    if sens and net:
-        findings.append(
-            SkillFinding(
-                severity="danger",
-                rule_id="credential_exfiltration",
-                reason="References sensitive credential files alongside outbound network commands",
-                snippet=f"{net.group(0)} ... {sens.group(0)}",
+    # Flag credential path access co-occurring on the same statement/line as an outbound network command
+    unfolded = re.sub(r"\\\r?\n", " ", combined)
+    for line in unfolded.splitlines():
+        sens = _SENSITIVE_TARGET_RE.search(line)
+        net = _NETWORK_CMD_RE.search(line)
+        if sens and net:
+            findings.append(
+                SkillFinding(
+                    severity="danger",
+                    rule_id="credential_exfiltration",
+                    reason="References sensitive credential files alongside outbound network commands",
+                    snippet=f"{net.group(0)} ... {sens.group(0)}",
+                )
             )
-        )
+            break
 
     safe = not any(f.severity == "danger" for f in findings)
     return SkillScanResult(safe=safe, findings=findings)

@@ -843,6 +843,8 @@ async def test_web_fetch_blocks_ssrf_and_unsafe_redirects(monkeypatch):
         def raise_for_status(self):
             return None
 
+    requested_urls: list[str] = []
+
     class RedirectClient:
         def __init__(self, *args, **kwargs):
             self.follow_redirects = kwargs.get("follow_redirects", True)
@@ -855,6 +857,7 @@ async def test_web_fetch_blocks_ssrf_and_unsafe_redirects(monkeypatch):
 
         async def get(self, url, **kwargs):
             assert self.follow_redirects is False
+            requested_urls.append(url)
             if url == "https://public.example/start":
                 return RedirectResponse(302, location="http://127.0.0.1/secret")
             if url == "https://public.example/hop1":
@@ -865,16 +868,22 @@ async def test_web_fetch_blocks_ssrf_and_unsafe_redirects(monkeypatch):
 
     fetch = WebFetchTool()
     # Direct private target rejected before connecting
+    requested_urls.clear()
     res_direct = await fetch.execute(url="http://169.254.169.254/latest/meta-data/")
     assert res_direct.status == "error"
+    assert requested_urls == []
 
     # Public URL redirecting to loopback is rejected before following redirect
+    requested_urls.clear()
     res_ssrf_redir = await fetch.execute(url="https://public.example/start")
     assert res_ssrf_redir.status == "error"
+    assert requested_urls == ["https://public.example/start"]
 
     # Safe public redirect completes
+    requested_urls.clear()
     res_ok = await fetch.execute(url="https://public.example/hop1")
     assert res_ok.status == "success" and "Reached safe target" in res_ok.output
+    assert requested_urls == ["https://public.example/hop1", "https://public.example/final"]
 
 
 @pytest.mark.asyncio
@@ -893,6 +902,7 @@ async def test_skill_manager_blocks_unsafe_skill_create_and_update(tmp_path):
     )
     assert bad_create.status == "error"
     assert engine.inspect_skill("bad-installer") is None
+    assert not (tmp_path / "skills" / "bad-installer" / "SKILL.md").exists()
 
     good_create = await mgr.execute(
         action="create",
@@ -977,9 +987,12 @@ async def test_phase6_review_edge_cases(tmp_path, monkeypatch):
     if os.name == "nt":
         assert is_sensitive_path(Path(str(tmp_path / ".env:secretstream"))) is not None
 
-    # 4. SearchFilesTool blocks symlink resolving outside workspace_root
+    # 4. SearchFilesTool blocks symlink resolving outside workspace_root while finding legit matches
     ws = tmp_path / "ws"
     ws.mkdir()
+    (ws / "legit.txt").write_text("TOP_SECRET_NEEDLE\n", encoding="utf-8")
+    (ws / ".env").write_text("SECRET_ENV=1\n", encoding="utf-8")
+    (ws / ".env.example").write_text("SECRET_ENV=\n", encoding="utf-8")
     secret_out = tmp_path / "outside_secret.txt"
     secret_out.write_text("TOP_SECRET_NEEDLE", encoding="utf-8")
     link_path = ws / "escape.txt"
@@ -988,10 +1001,60 @@ async def test_phase6_review_edge_cases(tmp_path, monkeypatch):
         symlink_created = True
     except OSError:
         symlink_created = False
+    search_scoped = SearchFilesTool(workspace_root=ws)
+    s_res = await search_scoped.execute(pattern="TOP_SECRET_NEEDLE", path=str(ws))
+    assert s_res.status == "success"
+    assert "legit.txt" in s_res.output
     if symlink_created:
-        search_scoped = SearchFilesTool(workspace_root=ws)
-        s_res = await search_scoped.execute(pattern="TOP_SECRET_NEEDLE", path=str(ws))
         assert "escape.txt" not in s_res.output
+
+    # 4b. ListDirectoryTool hides .env, skips escaped symlinks, keeps .env.example visible
+    from ivy.tools.files import FileTools
+    ft_ws = FileTools(workspace_root=ws, require_read_before_overwrite=True)
+    ls_res = await ft_ws.list_tool.execute(path=str(ws))
+    assert ls_res.status == "success"
+    assert ".env.example" in ls_res.output and "legit.txt" in ls_res.output
+    assert " .env\n" not in ls_res.output and not ls_res.output.endswith(" .env")
+    if symlink_created:
+        assert "escape.txt" not in ls_res.output
+
+    # 4c. File version staleness check on external edit & append=True allowed without prior read
+    tracked_file = ws / "tracked.txt"
+    tracked_file.write_text("alpha", encoding="utf-8")
+    assert (await ft_ws.read_tool.execute(path=str(tracked_file))).status == "success"
+    tracked_file.write_text("mutated_externally", encoding="utf-8")
+    stale_patch = await ft_ws.patch_tool.execute(
+        path=str(tracked_file), target="mutated", replacement="x"
+    )
+    assert stale_patch.status == "error" and "changed" in (stale_patch.error or "").lower()
+    stale_write = await ft_ws.write_tool.execute(path=str(tracked_file), content="beta")
+    assert stale_write.status == "error" and "changed" in (stale_write.error or "").lower()
+    append_ok = await ft_ws.write_tool.execute(path=str(tracked_file), content="\ngamma", append=True)
+    assert append_ok.status == "success"
+
+    # 4d. Windows ADS rejected on non-sensitive files while normal drive prefixes work
+    from ivy.tools.path_security import validate_file_path
+    if os.name == "nt":
+        ads_path, ads_err = validate_file_path(str(ws / "legit.txt:hidden"))
+        assert ads_path is None and ads_err is not None
+        ok_win, ok_win_err = validate_file_path(str(ws / "legit.txt"))
+        assert ok_win is not None and ok_win_err is None
+
+    # 4e. Invalid URL port rejected cleanly; _PinnedIPBackend uses pinned IP and rejects unpinned
+    bad_port_ok, _ = url_safety.validate_url_target("http://127.0.0.1:99999/")
+    assert bad_port_ok is False
+    backend = web_mod._PinnedIPBackend({"rebind.example": ["93.184.216.34"]})
+    connect_calls: list[tuple[str, int]] = []
+
+    async def fake_connect_tcp(host, port, **kwargs):
+        connect_calls.append((host, port))
+        return object()
+
+    backend._inner.connect_tcp = fake_connect_tcp  # type: ignore[method-assign]
+    await backend.connect_tcp("rebind.example", 443)
+    assert connect_calls == [("93.184.216.34", 443)]
+    with pytest.raises(ValueError, match="unpinned"):
+        await backend.connect_tcp("other.example", 443)
 
     # 5. WebFetchTool rejects max_redirects exceeded and protocol-relative loopback redirect
     monkeypatch.setattr(
@@ -1037,6 +1100,9 @@ async def test_phase6_review_edge_cases(tmp_path, monkeypatch):
     list_gen = await mnt.execute(action="list", category="general")
     assert "General fact" in list_gen.output and "Ops fact" not in list_gen.output
     assert (await mnt.execute(action="remove", note_id="bad-id")).status == "error"
+    assert (await mnt.execute(action="remove", note_id=True)).status == "error"
+    assert (await mnt.execute(action="remove", note_id=1.9)).status == "error"
+    assert len(await store.list_memory_notes()) == 2
     assert (await mnt.execute(action="search", query="  ")).status == "error"
     assert (await mnt.execute(action="unknown")).status == "error"
     await store.close()

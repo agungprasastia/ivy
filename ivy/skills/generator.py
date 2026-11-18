@@ -69,9 +69,10 @@ class SkillGenerator:
             skill.description,
             skill.instructions,
             metadata=skill.metadata,
+            status=skill.status,
         )
         if not scan.safe:
-            logger.warning("Skill reflection blocked by guard (%s): %s", skill.name, format_scan_rejection(scan))
+            logger.warning("Skill reflection blocked by guard: %s", format_scan_rejection(scan))
             return None
 
         self.skill_engine.save_skill(skill)

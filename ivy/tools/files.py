@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -16,11 +17,47 @@ if TYPE_CHECKING:
     from ivy.tools.checkpoint import FileCheckpointStore
     from ivy.tools.registry import ToolRegistry
 
+ReadTracker = dict[Path, bytes] | set[Path]
+
 
 def _normalize_workspace_root(workspace_root: str | Path | None) -> Path | None:
     if workspace_root is None:
         return None
     return Path(workspace_root).expanduser().resolve()
+
+
+def _compute_file_digest(file_path: Path) -> bytes:
+    """Return SHA-256 digest of file contents for staleness checks."""
+    return hashlib.sha256(file_path.read_bytes()).digest()
+
+
+def _record_read_version(tracker: ReadTracker | None, file_path: Path) -> None:
+    if tracker is None:
+        return
+    if isinstance(tracker, dict):
+        tracker[file_path] = _compute_file_digest(file_path)
+    else:
+        tracker.add(file_path)
+
+
+def _verify_read_version(
+    tracker: ReadTracker | None,
+    file_path: Path,
+    raw_path: str,
+    action: str,
+) -> str | None:
+    if tracker is None or file_path not in tracker:
+        verb = "overwriting" if action == "write" else "patching"
+        prefix = "existing file " if action == "write" else ""
+        return f"Must read {prefix}with read_file before {verb}: {raw_path}"
+    if isinstance(tracker, dict):
+        try:
+            current = _compute_file_digest(file_path)
+        except OSError as exc:
+            return f"Failed to verify file version before {action}: {exc}"
+        if current != tracker[file_path]:
+            return f"File changed since last read; re-read with read_file before {action}: {raw_path}"
+    return None
 
 
 def _build_diff_metadata(path_label: str, before: str, after: str) -> dict[str, Any]:
@@ -66,7 +103,7 @@ class ReadFileTool(BaseTool):
     def __init__(
         self,
         workspace_root: str | Path | None = None,
-        read_tracker: set[Path] | None = None,
+        read_tracker: ReadTracker | None = None,
     ) -> None:
         self.workspace_root = _normalize_workspace_root(workspace_root)
         self.read_tracker = read_tracker
@@ -113,8 +150,7 @@ class ReadFileTool(BaseTool):
             else:
                 content = "".join(lines)
 
-            if self.read_tracker is not None:
-                self.read_tracker.add(file_path)
+            _record_read_version(self.read_tracker, file_path)
 
             return ToolResult(
                 tool_name=self.name,
@@ -149,7 +185,7 @@ class WriteFileTool(BaseTool):
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
         workspace_root: str | Path | None = None,
-        read_tracker: set[Path] | None = None,
+        read_tracker: ReadTracker | None = None,
         require_read_before_overwrite: bool = False,
     ) -> None:
         self.checkpoint_store = checkpoint_store
@@ -178,16 +214,14 @@ class WriteFileTool(BaseTool):
             )
         try:
             existed_before = file_path.exists() and file_path.is_file()
-            if (
-                existed_before
-                and self.require_read_before_overwrite
-                and (self.read_tracker is None or file_path not in self.read_tracker)
-            ):
-                return ToolResult(
-                    tool_name=self.name,
-                    status="error",
-                    error=f"Must read existing file with read_file before overwriting: {path}",
-                )
+            if not append and existed_before and self.require_read_before_overwrite:
+                stale_err = _verify_read_version(self.read_tracker, file_path, path, "write")
+                if stale_err is not None:
+                    return ToolResult(
+                        tool_name=self.name,
+                        status="error",
+                        error=stale_err,
+                    )
             before_text = ""
             if existed_before:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -213,8 +247,7 @@ class WriteFileTool(BaseTool):
             with open(file_path, mode, encoding="utf-8") as f:
                 f.write(content)
 
-            if self.read_tracker is not None:
-                self.read_tracker.add(file_path)
+            _record_read_version(self.read_tracker, file_path)
 
             meta = _build_diff_metadata(path, before_text, after_text)
             if cp_id is not None:
@@ -278,8 +311,31 @@ class ListDirectoryTool(BaseTool):
         try:
             items = []
             for entry in os.scandir(dir_path):
-                kind = "DIR" if entry.is_dir() else "FILE"
-                size = entry.stat().st_size if entry.is_file() else 0
+                entry_path = Path(entry.path)
+                if should_skip_sensitive_entry(entry_path):
+                    continue
+                is_symlink = entry.is_symlink()
+                if is_symlink:
+                    try:
+                        resolved_target = entry_path.resolve()
+                    except (OSError, RuntimeError):
+                        continue
+                    if self.workspace_root is not None and not resolved_target.is_relative_to(
+                        self.workspace_root
+                    ):
+                        continue
+                    if should_skip_sensitive_entry(resolved_target):
+                        continue
+                kind = (
+                    "LINK"
+                    if is_symlink
+                    else ("DIR" if entry.is_dir(follow_symlinks=False) else "FILE")
+                )
+                size = (
+                    entry.stat(follow_symlinks=False).st_size
+                    if (not is_symlink and entry.is_file(follow_symlinks=False))
+                    else 0
+                )
                 items.append(f"{kind:<5} {size:>10} bytes  {entry.name}")
 
             output = "\n".join(sorted(items))
@@ -316,7 +372,7 @@ class PatchFileTool(BaseTool):
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
         workspace_root: str | Path | None = None,
-        read_tracker: set[Path] | None = None,
+        read_tracker: ReadTracker | None = None,
         require_read_before_overwrite: bool = False,
     ) -> None:
         self.checkpoint_store = checkpoint_store
@@ -349,15 +405,14 @@ class PatchFileTool(BaseTool):
                 status="error",
                 error=f"File not found: {path}",
             )
-        if (
-            self.require_read_before_overwrite
-            and (self.read_tracker is None or file_path not in self.read_tracker)
-        ):
-            return ToolResult(
-                tool_name=self.name,
-                status="error",
-                error=f"Must read file with read_file before patching: {path}",
-            )
+        if self.require_read_before_overwrite:
+            stale_err = _verify_read_version(self.read_tracker, file_path, path, "patch")
+            if stale_err is not None:
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=stale_err,
+                )
 
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -388,6 +443,8 @@ class PatchFileTool(BaseTool):
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(updated)
+
+            _record_read_version(self.read_tracker, file_path)
 
             meta = _build_diff_metadata(path, content, updated)
             if cp_id is not None:
@@ -473,7 +530,7 @@ class SearchFilesTool(BaseTool):
                     file_path = Path(dirpath) / filename
                     try:
                         resolved_file = file_path.resolve()
-                    except OSError:
+                    except (OSError, RuntimeError):
                         continue
                     if self.workspace_root is not None and not resolved_file.is_relative_to(
                         self.workspace_root
@@ -484,7 +541,7 @@ class SearchFilesTool(BaseTool):
                     ):
                         continue
                     try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        with open(resolved_file, "r", encoding="utf-8", errors="ignore") as f:
                             for lineno, line in enumerate(f, start=1):
                                 if regex.search(line):
                                     rel = file_path.relative_to(root)
@@ -519,10 +576,10 @@ class FileTools:
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
         workspace_root: str | Path | None = None,
-        read_tracker: set[Path] | None = None,
+        read_tracker: ReadTracker | None = None,
         require_read_before_overwrite: bool = False,
     ) -> None:
-        self._read_tracker: set[Path] = read_tracker if read_tracker is not None else set()
+        self._read_tracker: ReadTracker = read_tracker if read_tracker is not None else {}
         self.read_tool = ReadFileTool(
             workspace_root=workspace_root,
             read_tracker=self._read_tracker,

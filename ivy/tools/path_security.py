@@ -24,6 +24,20 @@ def has_control_chars(raw: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in raw)
 
 
+def has_windows_ads(raw: str) -> bool:
+    """Return True if a Windows path contains an NTFS alternate data stream colon."""
+    if os.name != "nt":
+        return False
+    check = raw.strip()
+    for prefix in ("\\\\?\\UNC\\", "\\\\?\\", "\\\\.\\"):
+        if check.upper().startswith(prefix):
+            check = check[len(prefix) :]
+            break
+    if len(check) >= 2 and check[0].isalpha() and check[1] == ":":
+        check = check[2:]
+    return ":" in check
+
+
 def is_sensitive_path(path: Path, *, allow_dotenv: bool = False) -> str | None:
     """Return a denial reason when path points to a credential or sensitive system file."""
     lower_parts = [_strip_windows_ads(part).lower() for part in path.parts]
@@ -62,6 +76,9 @@ def validate_file_path(
 
     if has_control_chars(raw_path):
         return None, "Invalid path: control characters are not allowed in file paths."
+
+    if has_windows_ads(raw_path):
+        return None, "Invalid path: Windows alternate data streams are not allowed."
 
     try:
         resolved = Path(raw_path).expanduser().resolve()

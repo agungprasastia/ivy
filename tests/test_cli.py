@@ -818,3 +818,80 @@ async def test_phase3_rollback_init_review_goal_and_mcp_slash_commands(tmp_path,
     assert "No MCP servers loaded" in buf.getvalue()
 
     await store.close()
+
+
+def test_expand_at_mentions_supports_urls():
+    from ivy.tui.helpers import expand_at_mentions
+
+    prompt, attached = expand_at_mentions(
+        "Check @url:https://example.com/docs and @https://example.org/spec"
+    )
+    assert "https://example.com/docs" in prompt
+    assert "https://example.org/spec" in prompt
+    assert any("example.com/docs" in item for item in attached)
+    assert any("example.org/spec" in item for item in attached)
+
+
+@pytest.mark.asyncio
+async def test_save_command_and_exporters_redact_secrets(tmp_path, monkeypatch):
+    from io import StringIO
+    from pathlib import Path
+    from rich.console import Console
+    from ivy.tui.helpers import export_session_json, export_session_markdown
+
+    secret_sk = "sk-proj-secret1234567890abcdef12"
+    secret_bearer = "tok_secret_bearer_value_998877"
+    msgs = [
+        ChatMessage(role=Role.USER, content=f"OPENAI_API_KEY={secret_sk}"),
+        ChatMessage(
+            role=Role.ASSISTANT,
+            content=f"Authorization: Bearer {secret_bearer}",
+        ),
+    ]
+
+    md_text = export_session_markdown("cli:sec", "Secret Check", msgs)
+    json_text = export_session_json("cli:sec", "Secret Check", msgs)
+    for body in (md_text, json_text):
+        assert secret_sk not in body
+        assert secret_bearer not in body
+
+    monkeypatch.chdir(tmp_path)
+    store = MemoryStore(db_path=str(tmp_path / "save_sec.db"))
+    await store.initialize()
+    await store.ensure_session("cli:sec")
+    for m in msgs:
+        await store.save_message("cli:sec", m)
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    skills = SkillEngine(skills_dir=str(skills_dir))
+    await skills.load_skills()
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        db_path=str(tmp_path / "save_sec.db"),
+        skills_dir=str(skills_dir),
+    )
+    llm = LLMClient(config=cfg)
+    mock_agent = MagicMock()
+    mock_agent.tool_registry = None
+    buf = StringIO()
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        session_id="cli:sec",
+        console=Console(file=buf, force_terminal=False, width=120),
+    )
+
+    assert await app.handle_slash_command("/save md") is True
+    assert await app.handle_slash_command("/save json") is True
+    exported = list(Path(tmp_path).glob("ivy_*"))
+    assert len(exported) == 2
+    for fp in exported:
+        content = fp.read_text(encoding="utf-8")
+        assert secret_sk not in content
+        assert secret_bearer not in content
+
+    await store.close()

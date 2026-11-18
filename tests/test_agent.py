@@ -390,3 +390,39 @@ async def test_agent_executes_concurrent_safe_tools_in_parallel(tmp_path):
     end_outputs = [ev["output"] for ev in events if ev["phase"] == "end"]
     assert end_outputs == ["data:A", "data:B"]
     await store.close()
+
+
+def test_truncate_head_tail_and_format_tool_result():
+    from ivy.core.prompt import format_tool_result, truncate_head_tail
+
+    long_output = "HEAD_START_" + ("x" * 24_000) + "_TAIL_END"
+    truncated = truncate_head_tail(long_output, max_chars=16_000)
+    assert truncated.startswith("HEAD_START_")
+    assert truncated.endswith("_TAIL_END")
+    assert len(truncated) < len(long_output)
+
+    formatted = format_tool_result(
+        ToolResult(tool_name="terminal", status="success", output=long_output)
+    )
+    assert "HEAD_START_" in formatted
+    assert "_TAIL_END" in formatted
+
+
+def test_redact_secrets_scrubs_keys_and_tokens():
+    from ivy.core.prompt import format_tool_result, redact_secrets
+
+    sample = (
+        "key1=sk-proj-1234567890abcdefghij123456\n"
+        "OPENAI_API_KEY=sk-live-secret-9876543210abcdef\n"
+        "Authorization: Bearer tok_super_secret_bearer_12345\n"
+    )
+    scrubbed = redact_secrets(sample)
+    assert "sk-proj-1234567890abcdefghij123456" not in scrubbed
+    assert "sk-live-secret-9876543210abcdef" not in scrubbed
+    assert "tok_super_secret_bearer_12345" not in scrubbed
+
+    formatted = format_tool_result(
+        ToolResult(tool_name="terminal", status="success", output=sample)
+    )
+    assert "sk-proj-1234567890abcdefghij123456" not in formatted
+    assert "tok_super_secret_bearer_12345" not in formatted

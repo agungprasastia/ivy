@@ -105,8 +105,9 @@ Override the model, resume a named session, or pick a theme:
 
 ```bash
 uv run ivy --model gemini/gemini-2.5-flash --session my-project
-uv run ivy --continue          # resume the most recently updated session
+uv run ivy -c                  # resume the most recently updated session (--continue)
 uv run ivy --theme ocean
+uv run ivy doctor              # run environment, DB, config & skill diagnostics
 ```
 
 ### One-Shot (non-interactive)
@@ -122,9 +123,10 @@ uv run ivy gateway start     # messaging + cron daemon
 uv run ivy gateway status    # show whitelist size
 ```
 
-### Skills & Cron from the CLI
+### CLI Subcommands (Skills, Cron, Diagnostics)
 
 ```bash
+uv run ivy doctor
 uv run ivy skills list
 uv run ivy skills inspect coding-assistant
 uv run ivy skills remove <name>
@@ -136,24 +138,28 @@ uv run ivy model              # print the active model
 
 ## TUI Commands
 
-Type `/` for autocomplete. Prefixes and aliases resolve automatically.
+Type `/` for autocomplete, or press **`Ctrl+P`** for the fuzzy command palette, **`Ctrl+G`** to compose in `$EDITOR`, and **`Ctrl+S`** to stash/restore drafts. Prefixes and aliases resolve automatically.
 
 | Command | Action |
 |---|---|
 | `/setup` | Configure API base URL, API key and model (writes to `.env`) |
-| `/model` | Switch model — picker, or `/model <name>` |
-| `/session` · `/resume` | Session picker; `/session list`, `/session <id\|#N>` |
+| `/model` | Interactive model picker, or `/model <name>` |
+| `/session` · `/resume` | Interactive session picker; `/session list`, `/session <id\|#N>` |
 | `/new` · `/fork` · `/title` | New session · branch current session · set/view title |
-| `/undo` · `/retry` | Roll back last turn · roll back and re-send the prompt |
-| `/history` · `/save` · `/copy` | Show turns · export (`md`/`json`) · copy last reply |
+| `/undo` · `/rewind` · `/retry` | Roll back last turn · rewind to any prompt · roll back and re-send |
+| `/rollback` | Inspect, diff, or restore automatic file edit checkpoints |
+| `/btw` | Ask an off-record side question without mutating session history |
+| `/history` · `/save` · `/copy` | Show turns · export secret-redacted `md`/`json` · copy last reply |
 | `/status` · `/context` · `/usage` | Session/approval state · token breakdown · API call totals |
 | `/compact` | LLM-summarise older turns to reclaim context |
-| `/diff` | `git diff` in the workspace (`/diff staged`, `/diff --stat`) |
-| `/verbose` · `/focus` | Cycle compact/verbose/focus · toggle tool-line hiding |
+| `/diff` · `/review` | `git diff` in workspace · LLM diff audit (`/review security`) |
+| `/init` · `/goal` | Generate `AGENTS.md` · autonomous loop with verification `--gate` |
+| `/todo` · `/profile` · `/mcp` | Track tasks · manage preferences · inspect loaded MCP servers |
+| `/verbose` · `/focus` · `/reasoning` | Cycle verbosity · toggle tool hiding · toggle thinking blocks |
 | `/yolo` | Toggle auto-approval of destructive commands for this session |
 | `/prompt` | Compose a multiline prompt in `$EDITOR` |
-| `/skills` · `/cron` · `/memory` | List/inspect/remove/reflect · list tasks · FTS5 search |
-| `/theme` · `/clear` · `/help` · `/exit` | Theme picker · clear session · help · quit |
+| `/skills` · `/cron` · `/memory` | List/inspect/remove/reflect · manage tasks · FTS5 search |
+| `/theme` · `/clear` · `/help` · `/exit` | Interactive theme picker · clear session · help · quit |
 
 ### Shell Escape
 
@@ -171,9 +177,10 @@ Mention workspace context inline; Ivy inlines it into the prompt before sending:
 Explain the failure in @src/ivy/core/agent.py
 Review @diff            # current git diff
 Review @staged          # staged git diff
+Check @url:https://example.com
 ```
 
-Files are capped at ~12 KB each to protect the context window.
+Files are capped at ~12 KB each to protect the context window, tool outputs use head+tail truncation (16 KB max), and known secrets (`sk-...`, `Bearer ...`, API keys) are redacted automatically from tool outputs and `/save` exports.
 
 ### Safety Approvals
 
@@ -191,10 +198,15 @@ When a destructive command is intercepted you choose:
 | Tool | Notes |
 |---|---|
 | `terminal` | PowerShell (Windows) / Bash, guarded by `SafetyApprovalPolicy` |
-| `read_file`, `write_file`, `list_directory`, `patch_file`, `search_files` | Workspace file operations |
+| `read_file`, `write_file`, `list_directory`, `patch_file`, `search_files` | Workspace file operations with reversible `FileCheckpointStore` snapshots |
 | `code_runner` | Isolated Python subprocess with timeout (default 30s) |
 | `web_fetch`, `web_search` | Readable text extraction / result lists |
-| `read_skill` | Load a `SKILL.md` on demand |
+| `read_skill`, `skill_manage` | Load a `SKILL.md` on demand · create/patch/delete learned skills |
+| `session_search` | SQLite FTS5 search across saved sessions |
+| `todo_list` | Structured task list tracking within a session |
+| `remember_preference` | Persistent user preference profile stored in SQLite |
+| `clarify` | Interactive multi-choice or custom clarifying question prompt |
+| `cron`, `delegate_task`, MCP tools | Conditional scheduler, isolated subagent runner, and `.mcp.json` stdio MCP tools |
 
 ---
 
@@ -202,15 +214,16 @@ When a destructive command is intercepted you choose:
 
 ```
 ivy/
-├── core/      # agent loop, LLM adapter, prompt, subagent, types
-├── tools/     # terminal, files, runner, web, registry, approval
+├── core/      # agent loop, LLM adapter, prompt & redaction, subagent, types
+├── tools/     # terminal, files, checkpoint, runner, web, registry, approval, mcp, todo, clarify, profile
 ├── memory/    # SQLite store, FTS5, context window, profile
-├── skills/    # SKILL.md engine, generator, read tool
+├── skills/    # SKILL.md engine, generator, read/manage tools
 ├── gateway/   # server, session hub, turn lease, adapters (cli/telegram/discord)
 ├── cron/      # scheduler & task model
-└── tui/       # app, prompt, picker, views, theme, helpers
+└── tui/       # app, commands, prompt, picker, views, theme, helpers, doctor
 skills/        # learned SKILL.md files
 tests/         # pytest suite
+AGENTS.md      # agent architecture & repo conventions
 ```
 
 ---

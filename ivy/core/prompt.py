@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform as _platform
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
@@ -213,11 +214,45 @@ def build_system_prompt(
     return "\n\n".join(s for s in sections if s and s.strip())
 
 
-def format_tool_result(result: ToolResult) -> str:
-    """Format a ToolResult into an observation string for the LLM."""
+_SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "sk-[REDACTED]"),
+    (re.compile(r"\bAIza[A-Za-z0-9_-]{25,}\b"), "AIza[REDACTED]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "gh_[REDACTED]"),
+    (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
+    (
+        re.compile(r"(?i)\b([A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD)\s*=\s*)([^\s\"']{8,})"),
+        r"\1[REDACTED]",
+    ),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Scrub API keys, bearer tokens, and sensitive env values from text."""
+    if not text:
+        return text
+    out = text
+    for pattern, repl in _SECRET_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def truncate_head_tail(text: str, max_chars: int = 16_000) -> str:
+    """Keep both head and tail of oversized tool output so trailing errors survive."""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return f"{text[:head]}\n... [truncated {omitted} chars] ...\n{text[-tail:]}"
+
+
+def format_tool_result(result: ToolResult, max_chars: int = 16_000) -> str:
+    """Format, scrub secrets, and head+tail bound a ToolResult for the LLM."""
     parts = [f"status={result.status}"]
     if result.output:
-        parts.append(f"output:\n{result.output}")
+        clean_out = redact_secrets(truncate_head_tail(result.output, max_chars=max_chars))
+        parts.append(f"output:\n{clean_out}")
     if result.error:
-        parts.append(f"error:\n{result.error}")
+        clean_err = redact_secrets(truncate_head_tail(result.error, max_chars=max_chars))
+        parts.append(f"error:\n{clean_err}")
     return "\n".join(parts)

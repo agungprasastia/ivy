@@ -49,3 +49,7 @@ htmlcov/
 
 # Reference repository
 _ref_hermes/
+
+# Local tooling & workspace overrides
+.superpowers/
+.mcp.json.local

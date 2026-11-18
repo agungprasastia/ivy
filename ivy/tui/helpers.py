@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ivy.core.prompt import redact_secrets
 from ivy.core.types import ChatMessage
 
 COMMAND_ALIASES: dict[str, str] = {
@@ -139,7 +140,7 @@ def run_git_diff(staged: bool = False, stat: bool = False, cwd: str | None = Non
         return f"git diff failed: {exc}"
 
 
-_MENTION_RE = re.compile(r"(?<!\S)@([A-Za-z0-9_./\\-]+)")
+_MENTION_RE = re.compile(r"(?<!\S)@((?:url:)?https?://[^\s]+|[A-Za-z0-9_./\\-]+)")
 
 
 def expand_at_mentions(
@@ -147,7 +148,7 @@ def expand_at_mentions(
     cwd: str | None = None,
     max_file_bytes: int = 12_000,
 ) -> tuple[str, list[str]]:
-    """Expand @diff, @staged, and @path mentions into attached context blocks."""
+    """Expand @diff, @staged, @url:https://..., and @path mentions into attached context."""
     root = Path(cwd or os.getcwd()).resolve()
     attached_labels: list[str] = []
     blocks: list[str] = []
@@ -158,6 +159,14 @@ def expand_at_mentions(
         if token in seen:
             continue
         seen.add(token)
+
+        if token.startswith(("url:http://", "url:https://", "http://", "https://")):
+            url = token[4:] if token.startswith("url:") else token
+            blocks.append(
+                f'<url_reference href="{url}">Use web_fetch on {url} if full page contents are needed.</url_reference>'
+            )
+            attached_labels.append(f"@{url}")
+            continue
 
         if token == "diff":
             diff = run_git_diff(staged=False, cwd=str(root))
@@ -290,7 +299,7 @@ def export_session_markdown(
             role_label = f"{role_label} ({msg.name})"
         lines.append(f"## {role_label} · {ts}")
         lines.append("")
-        lines.append(msg.content or "")
+        lines.append(redact_secrets(msg.content or ""))
         lines.append("")
     return "\n".join(lines)
 
@@ -300,11 +309,15 @@ def export_session_json(
     title: str | None,
     messages: Iterable[ChatMessage],
 ) -> str:
-    """Render session transcript to formatted JSON."""
+    """Render session transcript to formatted JSON with secrets redacted."""
+    scrubbed = [
+        msg.model_copy(update={"content": redact_secrets(msg.content or "")})
+        for msg in messages
+    ]
     payload = {
         "session_id": session_id,
         "title": title,
-        "messages": [msg.model_dump(mode="json") for msg in messages],
+        "messages": [msg.model_dump(mode="json") for msg in scrubbed],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 

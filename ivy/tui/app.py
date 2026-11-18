@@ -167,7 +167,7 @@ def build_default_tool_registry(
         require_read_before_overwrite=True,
     ).register_all(registry)
     registry.register(CodeRunnerTool(timeout=config.code_runner_timeout))
-    registry.register(WebFetchTool())
+    registry.register(WebFetchTool(allow_private_urls=config.allow_private_urls))
     registry.register(WebSearchTool())
     registry.register(TodoListTool(store=todo_store, session_id_getter=session_id_getter))
     if interactive or clarify_callback is not None:

@@ -182,8 +182,15 @@ async def test_web_tools_extract_and_search(monkeypatch):
         async def get(self, url, **kwargs):
             return FakeResponse()
 
+    import socket
+    import ivy.tools.url_safety as url_safety
     import ivy.tools.web as web_mod
 
+    monkeypatch.setattr(
+        url_safety.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
     monkeypatch.setattr(web_mod.httpx, "AsyncClient", FakeClient)
 
     fetch = WebFetchTool()
@@ -773,3 +780,98 @@ async def test_path_security_workspace_containment_and_read_before_write(tmp_pat
     assert p_after_read.status == "success"
     w_after_read = await scoped.write_tool.execute(path=str(existing), content="a = 30\n")
     assert w_after_read.status == "success"
+
+
+def test_url_safety_blocks_private_and_metadata():
+    import socket
+    from ivy.tools.url_safety import validate_url_target
+
+    # Direct private / loopback / metadata IP literals and hosts
+    for blocked in [
+        "http://127.0.0.1:8080/admin",
+        "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://10.0.0.5/internal",
+        "http://192.168.1.10/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://localhost:3000",
+        "file:///etc/passwd",
+    ]:
+        ok, _ = validate_url_target(blocked)
+        assert ok is False, f"Expected SSRF block for {blocked}"
+
+    # DNS resolution returning private IP must be blocked even for public-looking domain
+    def fake_private_resolver(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.50", 0))]
+
+    ok_dns, reason_dns = validate_url_target("https://evil-rebind.example", resolver=fake_private_resolver)
+    assert ok_dns is False and "private" in reason_dns.lower()
+
+    # Public DNS succeeds
+    def fake_public_resolver(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    ok_pub, _ = validate_url_target("https://example.com/docs", resolver=fake_public_resolver)
+    assert ok_pub is True
+
+    # allow_private=True permits localhost/RFC1918 while still blocking cloud metadata
+    ok_local, _ = validate_url_target("http://127.0.0.1:20128/v1", allow_private=True)
+    assert ok_local is True
+    ok_meta, _ = validate_url_target("http://169.254.169.254/latest/meta-data/", allow_private=True)
+    assert ok_meta is False
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_blocks_ssrf_and_unsafe_redirects(monkeypatch):
+    import socket
+    import ivy.tools.url_safety as url_safety
+    import ivy.tools.web as web_mod
+
+    monkeypatch.setattr(
+        url_safety.socket,
+        "getaddrinfo",
+        lambda host, port, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+
+    class RedirectResponse:
+        def __init__(self, status_code: int, location: str = "", text: str = ""):
+            self.status_code = status_code
+            self.headers = {"Location": location} if location else {}
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class RedirectClient:
+        def __init__(self, *args, **kwargs):
+            self.follow_redirects = kwargs.get("follow_redirects", True)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            assert self.follow_redirects is False
+            if url == "https://public.example/start":
+                return RedirectResponse(302, location="http://127.0.0.1/secret")
+            if url == "https://public.example/hop1":
+                return RedirectResponse(302, location="https://public.example/final")
+            return RedirectResponse(200, text="<html><body><p>Reached safe target</p></body></html>")
+
+    monkeypatch.setattr(web_mod.httpx, "AsyncClient", RedirectClient)
+
+    fetch = WebFetchTool()
+    # Direct private target rejected before connecting
+    res_direct = await fetch.execute(url="http://169.254.169.254/latest/meta-data/")
+    assert res_direct.status == "error"
+
+    # Public URL redirecting to loopback is rejected before following redirect
+    res_ssrf_redir = await fetch.execute(url="https://public.example/start")
+    assert res_ssrf_redir.status == "error"
+
+    # Safe public redirect completes
+    res_ok = await fetch.execute(url="https://public.example/hop1")
+    assert res_ok.status == "success" and "Reached safe target" in res_ok.output

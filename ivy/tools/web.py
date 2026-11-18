@@ -6,7 +6,7 @@ import html
 import re
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 try:
     import httpx
@@ -15,6 +15,7 @@ except ImportError:  # openai>=3 / anthropic>=2 may bundle httpx2
 
 from ivy.core.types import ToolResult
 from ivy.tools.base import BaseTool
+from ivy.tools.url_safety import validate_url_target
 
 
 class _TextExtractor(HTMLParser):
@@ -66,19 +67,48 @@ class WebFetchTool(BaseTool):
         "required": ["url"],
     }
 
-    def __init__(self, timeout: float = 15.0) -> None:
+    def __init__(
+        self,
+        timeout: float = 15.0,
+        allow_private_urls: bool = False,
+        max_redirects: int = 5,
+    ) -> None:
         self.timeout = timeout
+        self.allow_private_urls = allow_private_urls
+        self.max_redirects = max(0, max_redirects)
 
     async def execute(self, url: str, max_chars: int = 8000, **kwargs: Any) -> ToolResult:
-        if not url.startswith(("http://", "https://")):
-            return ToolResult(
-                tool_name=self.name,
-                status="error",
-                error="URL must start with http:// or https://",
-            )
+        ok, err = validate_url_target(url, allow_private=self.allow_private_urls)
+        if not ok:
+            return ToolResult(tool_name=self.name, status="error", error=err)
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": "IvyAgent/0.1"})
+            current_url = url
+            resp: Any = None
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                for hop in range(self.max_redirects + 1):
+                    resp = await client.get(current_url, headers={"User-Agent": "IvyAgent/0.1"})
+                    status_code = getattr(resp, "status_code", 200)
+                    headers = getattr(resp, "headers", {}) or {}
+                    location = headers.get("Location") or headers.get("location")
+                    if status_code in (301, 302, 303, 307, 308) and location:
+                        if hop >= self.max_redirects:
+                            return ToolResult(
+                                tool_name=self.name,
+                                status="error",
+                                error=f"Too many redirects (max {self.max_redirects})",
+                            )
+                        next_url = urljoin(current_url, str(location))
+                        redir_ok, redir_err = validate_url_target(
+                            next_url, allow_private=self.allow_private_urls
+                        )
+                        if not redir_ok:
+                            return ToolResult(tool_name=self.name, status="error", error=redir_err)
+                        current_url = next_url
+                        continue
+                    break
+
+                assert resp is not None
                 resp.raise_for_status()
             text = _extract_visible_text(resp.text)
             if len(text) > max_chars:

@@ -39,7 +39,6 @@ from ivy.tui.views import (
     render_checkpoints_table,
     render_context_panel,
     render_diff_output,
-    render_error,
     render_help_table,
     render_history_view,
     render_mcp_table,

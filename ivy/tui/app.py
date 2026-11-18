@@ -5,17 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
-import platform
-import shlex
-import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
-from uuid import uuid4
 
 from prompt_toolkit.formatted_text import FormattedText, HTML
 from rich import box as rich_box
@@ -29,11 +23,9 @@ from ivy.config import IvyConfig, load_config, update_env_file
 from ivy.core.agent import IvyAgent
 from ivy.core.llm import LLMClient
 from ivy.core.subagent import SubagentRunner
-from ivy.core.types import ChatMessage, Role
 from ivy.cron.scheduler import CronScheduler
-from ivy.cron.task import ScheduledTask
 from ivy.gateway.server import GatewayServer
-from ivy.memory.context import ContextWindowManager, compute_context_breakdown
+from ivy.memory.context import compute_context_breakdown
 from ivy.memory.store import MemoryStore
 from ivy.skills.engine import SkillEngine
 from ivy.skills.generator import SkillGenerator
@@ -56,46 +48,26 @@ from ivy.tools.web import WebFetchTool, WebSearchTool
 from ivy.tui.commands import SlashCommandMixin
 from ivy.tui.doctor import render_doctor_report, run_doctor_checks
 from ivy.tui.helpers import (
-    copy_to_clipboard,
+    copy_to_clipboard,  # noqa: F401 - exposed for _app_ns() & test monkeypatches
     expand_at_mentions,
-    export_session_json,
-    export_session_markdown,
     extract_thinking_blocks,
-    format_relative_time,
-    format_token_count,
     get_git_branch,
-    resolve_slash_command,
-    run_git_diff,
+    run_git_diff,  # noqa: F401 - exposed for _app_ns() & test monkeypatches
 )
 from ivy.tui.picker import PickerOption, run_interactive_picker
 from ivy.tui.prompt import (
-    SLASH_COMMAND_META,
-    SLASH_COMMANDS,
     build_bottom_toolbar,
-    build_prompt_style,
     create_prompt_session,
 )
-from ivy.tui.theme import ThemeConfig, get_theme, list_themes
+from ivy.tui.theme import ThemeConfig, get_theme
 from ivy.tui.views import (
     create_console,
     render_assistant_reply,
     render_banner,
-    render_checkpoints_table,
-    render_context_panel,
-    render_diff_output,
     render_error,
-    render_help_table,
-    render_history_view,
-    render_mcp_table,
-    render_memory_results,
-    render_profile_table,
-    render_sessions_table,
     render_skills_table,
-    render_status_panel,
-    render_todo_panel,
     render_tool_event,
     render_turn_footer,
-    render_usage_table,
 )
 
 _NOISY_HTTP_LOGGERS = (
@@ -373,10 +345,6 @@ class IvyCLIApp(SlashCommandMixin):
 
     async def _interactive_approval(self, command: str) -> Any:
         """Pause active spinner and present rich multi-option safety approval prompt."""
-        from rich import box as rich_box
-        from rich.markup import escape as rich_escape
-        from rich.panel import Panel as RichPanel
-
         status = self._active_status
         if status is not None:
             status.stop()

@@ -236,7 +236,6 @@ def render_turn_footer(
     theme: ThemeConfig | None = None,
 ) -> None:
     """Print subtle per-turn metrics footer beneath assistant response."""
-    t = theme or get_theme()
     parts = [f"{duration_s:.1f}s"]
     if tool_count > 0:
         parts.append(f"{tool_count} tool{'s' if tool_count != 1 else ''}")
@@ -516,38 +515,6 @@ def render_history_view(
         elif msg.role == Role.TOOL:
             first = body.splitlines()[0][:100] if body else ""
             console.print(f"  [dim][{ts}] ⚙ {escape(msg.name or 'tool')}: {escape(first)}[/dim]")
-
-
-def render_session_recap(
-    console: Console,
-    session_id: str,
-    title: str | None,
-    messages: list[ChatMessage],
-    theme: ThemeConfig | None = None,
-) -> None:
-    """Show concise recap when switching or resuming a non-empty session."""
-    if not messages:
-        return
-    t = theme or get_theme()
-    convo = [m for m in messages if m.role in (Role.USER, Role.ASSISTANT) and (m.content or "").strip()]
-    recent = convo[-4:]
-    lines = []
-    for m in recent:
-        who = f"[{t.ui_accent}]You[/]" if m.role == Role.USER else f"[{t.ui_label}]Ivy[/]"
-        snippet = (m.content or "").strip().replace("\n", " ")[:110]
-        if len((m.content or "").strip()) > 110:
-            snippet += "…"
-        lines.append(f"{who}: {escape(snippet)}")
-    header = f"Resumed {session_id}" + (f" · {title}" if title else "") + f" ({len(messages)} msgs)"
-    console.print(
-        Panel(
-            "\n".join(lines),
-            title=f"[{t.banner_title}]{escape(header)}[/]",
-            border_style=t.banner_dim,
-            box=box.ROUNDED,
-            expand=False,
-        )
-    )
 
 
 def render_diff_output(

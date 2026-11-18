@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -17,14 +18,20 @@ from typing import Any, Awaitable, Callable, Sequence
 from uuid import uuid4
 
 from prompt_toolkit.formatted_text import FormattedText, HTML
+from rich import box as rich_box
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
+from rich.panel import Panel as RichPanel
 
 from ivy.config import IvyConfig, load_config, update_env_file
 from ivy.core.agent import IvyAgent
 from ivy.core.llm import LLMClient
+from ivy.core.subagent import SubagentRunner
+from ivy.core.types import ChatMessage, Role
 from ivy.cron.scheduler import CronScheduler
+from ivy.cron.task import ScheduledTask
 from ivy.gateway.server import GatewayServer
 from ivy.memory.context import ContextWindowManager, compute_context_breakdown
 from ivy.memory.store import MemoryStore
@@ -32,16 +39,22 @@ from ivy.skills.engine import SkillEngine
 from ivy.skills.generator import SkillGenerator
 from ivy.skills.tool import ReadSkillTool
 from ivy.tools.approval import SafetyApprovalPolicy
+from ivy.tools.clarify import ClarifyTool
+from ivy.tools.delegate import DelegateTaskTool
 from ivy.tools.files import FileTools
+from ivy.tools.profile import RememberPreferenceTool
 from ivy.tools.registry import ToolRegistry
 from ivy.tools.runner import CodeRunnerTool
 from ivy.tools.terminal import TerminalTool
+from ivy.tools.todo import TodoListTool, TodoStore
 from ivy.tools.web import WebFetchTool, WebSearchTool
+from ivy.tui.doctor import render_doctor_report, run_doctor_checks
 from ivy.tui.helpers import (
     copy_to_clipboard,
     expand_at_mentions,
     export_session_json,
     export_session_markdown,
+    extract_thinking_blocks,
     format_relative_time,
     format_token_count,
     get_git_branch,
@@ -50,6 +63,7 @@ from ivy.tui.helpers import (
 )
 from ivy.tui.picker import PickerOption, run_interactive_picker
 from ivy.tui.prompt import (
+    SLASH_COMMAND_META,
     SLASH_COMMANDS,
     build_bottom_toolbar,
     build_prompt_style,
@@ -66,9 +80,11 @@ from ivy.tui.views import (
     render_help_table,
     render_history_view,
     render_memory_results,
+    render_profile_table,
     render_sessions_table,
     render_skills_table,
     render_status_panel,
+    render_todo_panel,
     render_tool_event,
     render_turn_footer,
     render_usage_table,
@@ -128,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
     cron_sub = cron_parser.add_subparsers(dest="cron_action")
     cron_sub.add_parser("list", help="List scheduled tasks")
 
+    doc_parser = subparsers.add_parser("doctor", help="Diagnose environment, endpoint, DB & tools")
+    doc_parser.add_argument("--fix", action="store_true", help="Auto-create missing .env / skills dir")
+    doc_parser.add_argument("--no-live", dest="no_live", action="store_true", help="Skip HTTP endpoint probe")
+
     return parser
 
 
@@ -138,6 +158,11 @@ def build_default_tool_registry(
     skill_engine: SkillEngine | None = None,
     approval_callback: Callable[[str], bool | Awaitable[bool]] | None = None,
     approval_policy: SafetyApprovalPolicy | None = None,
+    memory_store: MemoryStore | None = None,
+    llm_client: LLMClient | None = None,
+    todo_store: TodoStore | None = None,
+    session_id_getter: Callable[[], str] | None = None,
+    clarify_callback: Callable[[str, list[str], bool], Any] | None = None,
 ) -> ToolRegistry:
     """Create and populate the default ToolRegistry."""
     registry = ToolRegistry()
@@ -152,8 +177,23 @@ def build_default_tool_registry(
     registry.register(CodeRunnerTool(timeout=config.code_runner_timeout))
     registry.register(WebFetchTool())
     registry.register(WebSearchTool())
+    registry.register(TodoListTool(store=todo_store, session_id_getter=session_id_getter))
+    if interactive or clarify_callback is not None:
+        registry.register(ClarifyTool(clarify_callback=clarify_callback))
+    if memory_store is not None:
+        registry.register(RememberPreferenceTool(memory_store=memory_store))
     if skill_engine is not None:
         registry.register(ReadSkillTool(skill_engine=skill_engine))
+    if llm_client is not None:
+        runner = SubagentRunner(
+            llm_client=llm_client,
+            tool_registry=registry,
+            memory_store=memory_store,
+            max_iterations=config.subagent_max_iterations,
+        )
+        registry.register(
+            DelegateTaskTool(runner=runner, session_id_getter=session_id_getter)
+        )
     return registry
 
 
@@ -190,10 +230,15 @@ class IvyCLIApp:
         self.approval_policy = approval_policy or self._discover_approval_policy()
         self.history_path = history_path
         self.display_mode: str = "verbose" if getattr(config, "verbose", False) else "compact"
+        self.reasoning_mode: str = "collapsed"
+        self.todo_store: TodoStore = self._discover_todo_store() or TodoStore()
         self._active_status: Any = None
         self._prompt_session: Any = None
         self._session_title: str | None = None
         self._git_branch: str | None = get_git_branch()
+        self._last_reasoning: str = ""
+        self._prompt_stash: list[str] = []
+        self._pending_prefill: str = ""
         self._usage_stats: dict[str, int] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -204,6 +249,16 @@ class IvyCLIApp:
         self._ctx_percent: float | None = None
         self._last_duration_s: float | None = None
         self._cached_sessions: list[dict[str, Any]] = []
+
+    def _discover_todo_store(self) -> TodoStore | None:
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get"):
+            return None
+        try:
+            tool = registry.get("todo_list")
+            return getattr(tool, "store", None)
+        except Exception:
+            return None
 
     def _discover_approval_policy(self) -> SafetyApprovalPolicy | None:
         registry = getattr(self.agent, "tool_registry", None)
@@ -427,6 +482,229 @@ class IvyCLIApp:
         finally:
             if status is not None:
                 status.start()
+
+    async def _interactive_clarify(
+        self, question: str, choices: list[str], multi_select: bool
+    ) -> Any:
+        """Ask user a structured clarifying question via picker or prompt fallback."""
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            if choices and not multi_select and self._can_open_picker():
+                opts = [PickerOption(value=c, label=c) for c in choices]
+                opts.append(PickerOption(value="__OTHER__", label="Other (type custom answer)"))
+                res = await run_interactive_picker(
+                    title=question[:60],
+                    options=opts,
+                    theme=self.theme,
+                )
+                if res.action == "select" and res.value and res.value != "__OTHER__":
+                    return res.value
+                if res.action == "cancel":
+                    return ""
+                answer = await asyncio.to_thread(lambda: input(f"  {question}: ").strip())
+                return answer
+
+            self.console.print(f"\n[bold {self.theme.ui_accent}]? {rich_escape(question)}[/]")
+            for idx, ch in enumerate(choices, start=1):
+                self.console.print(f"  [dim]{idx}.[/] {rich_escape(ch)}")
+            prompt_lbl = (
+                "Enter numbers/choices (comma-separated) or text: "
+                if multi_select and choices
+                else "Choice # or answer: "
+            )
+            raw = await asyncio.to_thread(lambda: input(prompt_lbl).strip())
+            if multi_select:
+                picked: list[str] = []
+                for part in raw.split(","):
+                    tok = part.strip()
+                    if tok.isdigit() and 1 <= int(tok) <= len(choices):
+                        picked.append(choices[int(tok) - 1])
+                    elif tok:
+                        picked.append(tok)
+                return picked
+            if raw.isdigit() and 1 <= int(raw) <= len(choices):
+                return choices[int(raw) - 1]
+            return raw
+        except (EOFError, KeyboardInterrupt):
+            return [] if multi_select else ""
+        finally:
+            if status is not None:
+                status.start()
+
+    async def _run_command_palette(self) -> bool:
+        """Open Ctrl+P fuzzy command palette and execute the chosen command."""
+        options = [
+            PickerOption(
+                value=cmd,
+                label=cmd,
+                meta=SLASH_COMMAND_META.get(cmd, ""),
+            )
+            for cmd in SLASH_COMMANDS
+        ]
+        if not self._can_open_picker():
+            render_help_table(self.console, theme=self.theme)
+            return True
+        res = await run_interactive_picker(
+            title="Command Palette",
+            options=options,
+            theme=self.theme,
+        )
+        if res.action == "select" and res.value:
+            return await self.handle_slash_command(res.value)
+        return True
+
+    async def _handle_btw(self, question: str) -> None:
+        """Ask a quick side question against snapshot history without mutating MemoryStore."""
+        if not question:
+            self.console.print(f"[{self.theme.ui_warn}]Usage: /btw <side question>[/]")
+            return
+        history = await self.memory_store.get_messages(self.session_id, limit=30)
+        messages = [
+            ChatMessage(
+                role=Role.SYSTEM,
+                content="Answer the user's side question concisely using session context without invoking tools.",
+            ),
+            *history,
+            ChatMessage(role=Role.USER, content=question),
+        ]
+        status = self.console.status(
+            f"[{self.theme.ui_accent}]{self.theme.glyph} Quick answer (/btw)...[/]",
+            spinner="dots",
+        )
+        try:
+            with status:
+                reply = await self.llm_client.chat_completion(messages=messages, stream=False)
+            raw_text = (
+                reply.content
+                if isinstance(reply, ChatMessage)
+                else "".join([c async for c in reply])
+            ) or ""
+            visible, _ = extract_thinking_blocks(raw_text)
+            self.console.print(
+                RichPanel(
+                    Markdown(visible or raw_text or "(empty)"),
+                    title=f"[bold {self.theme.ui_label}]BTW (off-record)[/]",
+                    border_style=self.theme.banner_dim,
+                    box=rich_box.ROUNDED,
+                    expand=False,
+                )
+            )
+        except Exception as exc:
+            render_error(self.console, exc, theme=self.theme)
+
+    async def _handle_rewind(self, args: list[str]) -> None:
+        """Roll back session to a chosen earlier user prompt for editing or re-running."""
+        turns = await self.memory_store.get_user_turns(self.session_id)
+        if not turns:
+            self.console.print(f"[{self.theme.ui_warn}]No user turns in this session to rewind.[/]")
+            return
+
+        target: dict[str, Any] | None = None
+        if args and args[0].isdigit():
+            idx = int(args[0]) - 1
+            if 0 <= idx < len(turns):
+                target = turns[idx]
+        elif self._can_open_picker():
+            options = [
+                PickerOption(
+                    value=str(t["id"]),
+                    label=" ".join((t["content"] or "").split())[:64],
+                    meta=f"turn #{i} · {format_relative_time(t.get('created_at'))}",
+                )
+                for i, t in enumerate(turns, start=1)
+            ]
+            res = await run_interactive_picker(
+                title=f"Rewind Session ({len(turns)} turns)",
+                options=options,
+                current_value=str(turns[-1]["id"]),
+                theme=self.theme,
+            )
+            if res.action != "select" or not res.value:
+                return
+            by_id = {str(t["id"]): t for t in turns}
+            target = by_id.get(res.value)
+        else:
+            for i, t in enumerate(turns, start=1):
+                snippet = " ".join((t["content"] or "").split())[:72]
+                self.console.print(f"  [dim]{i}.[/] {rich_escape(snippet)}")
+            self.console.print("[dim]Run /rewind <#> to roll back to turn #.[/dim]")
+            return
+
+        if target is None:
+            self.console.print(f"[{self.theme.ui_warn}]Turn not found.[/]")
+            return
+
+        prompt_text, deleted = await self.memory_store.rewind_to_message_id(
+            self.session_id, int(target["id"])
+        )
+        await self._refresh_session_metadata()
+        self._pending_prefill = prompt_text or ""
+        self.console.print(
+            f"[{self.theme.ui_ok}]Rewound {deleted} messages[/] — prompt loaded for edit/resend."
+        )
+
+    async def _handle_cron_command(self, raw_line: str, args: list[str]) -> None:
+        action = args[0].lower() if args else "list"
+        if action == "list":
+            tasks = self.cron_scheduler.list_tasks()
+            if not tasks:
+                self.console.print("[dim]No scheduled cron tasks registered.[/dim]")
+                return
+            for t in tasks:
+                state = f"[{self.theme.ui_ok}]active[/]" if t.enabled else "[dim]paused[/dim]"
+                self.console.print(
+                    f"- [bold]{rich_escape(t.name)}[/bold] [{state}] `{t.cron_expr}` "
+                    f"(next: {t.next_run}) — {rich_escape((t.prompt or '')[:60])}"
+                )
+            return
+
+        if action == "add":
+            try:
+                tokens = shlex.split(raw_line)
+            except ValueError as exc:
+                self.console.print(f"[{self.theme.ui_error}]Invalid quotes:[/] {exc}")
+                return
+            if len(tokens) < 5:
+                self.console.print(
+                    f"[{self.theme.ui_warn}]Usage: /cron add <name> \"<cron_expr>\" <prompt>[/]"
+                )
+                return
+            name, expr = tokens[2], tokens[3]
+            prompt = " ".join(tokens[4:]).strip()
+            try:
+                task = ScheduledTask(name=name, cron_expr=expr, prompt=prompt, enabled=True)
+            except ValueError as exc:
+                self.console.print(f"[{self.theme.ui_error}]Invalid cron expression:[/] {exc}")
+                return
+            self.cron_scheduler.add_task(task)
+            await self.memory_store.save_cron_job(name, expr, prompt, enabled=True)
+            self.console.print(f"[{self.theme.ui_ok}]Added cron job[/] `{name}` (`{expr}`).")
+            return
+
+        if action in ("pause", "resume", "remove") and len(args) >= 2:
+            name = args[1]
+            if action == "pause":
+                ok = self.cron_scheduler.pause_task(name)
+                if ok:
+                    await self.memory_store.set_cron_job_enabled(name, False)
+                msg = f"Paused '{name}'" if ok else f"Cron job '{name}' not found"
+            elif action == "resume":
+                ok = self.cron_scheduler.resume_task(name)
+                if ok:
+                    await self.memory_store.set_cron_job_enabled(name, True)
+                msg = f"Resumed '{name}'" if ok else f"Cron job '{name}' not found"
+            else:
+                ok = self.cron_scheduler.remove_task(name)
+                await self.memory_store.delete_cron_job(name)
+                msg = f"Removed '{name}'" if ok else f"Cron job '{name}' not found"
+            self.console.print(msg)
+            return
+
+        self.console.print(
+            f"[{self.theme.ui_warn}]Usage: /cron [list | add <name> \"<expr>\" <prompt> | pause <name> | resume <name> | remove <name>][/]"
+        )
 
     async def _handle_setup(self, args: list[str]) -> None:
         """Configure API base URL, API key, and default model, persisting to .env."""
@@ -919,13 +1197,87 @@ class IvyCLIApp:
             return True
 
         if cmd == "/cron":
-            tasks = self.cron_scheduler.list_tasks()
-            if not tasks:
-                self.console.print("[dim]No scheduled cron tasks registered.[/dim]")
-            else:
-                for t in tasks:
-                    self.console.print(f"- {t.name}: `{t.cron_expr}` (next: {t.next_run})")
+            await self._handle_cron_command(raw_line, args)
             return True
+
+        if cmd == "/doctor":
+            fix = any(a == "--fix" for a in args)
+            live_probe = not any(a == "--no-live" for a in args)
+            findings = await run_doctor_checks(
+                config=self.config,
+                llm_client=self.llm_client,
+                memory_store=self.memory_store,
+                skill_engine=self.skill_engine,
+                live_probe=live_probe,
+                fix=fix,
+                env_path=self.env_path or ".env",
+            )
+            render_doctor_report(self.console, findings, theme=self.theme)
+            return True
+
+        if cmd == "/reasoning":
+            arg = args[0].lower() if args else ""
+            if arg == "show":
+                if not self._last_reasoning:
+                    self.console.print("[dim]No captured <think> reasoning block for the last turn.[/dim]")
+                else:
+                    self.console.print(
+                        RichPanel(
+                            rich_escape(self._last_reasoning),
+                            title=f"[bold {self.theme.ui_label}]Last Reasoning Block[/]",
+                            border_style=self.theme.banner_dim,
+                            box=rich_box.ROUNDED,
+                            expand=False,
+                        )
+                    )
+            elif arg in ("collapsed", "stream", "hide"):
+                self.reasoning_mode = arg
+                self.console.print(f"Reasoning mode: [bold {self.theme.ui_accent}]{arg}[/]")
+            else:
+                self.console.print(
+                    f"Reasoning mode: [bold {self.theme.ui_accent}]{self.reasoning_mode}[/] "
+                    "(use: collapsed | stream | hide | show)"
+                )
+            return True
+
+        if cmd == "/todo":
+            sub = args[0].lower() if args else "list"
+            if sub == "clear":
+                self.todo_store.clear(self.session_id)
+                self.console.print("[dim]Cleared task checklist for this session.[/dim]")
+            else:
+                render_todo_panel(self.console, self.todo_store.get(self.session_id), theme=self.theme)
+            return True
+
+        if cmd == "/profile":
+            sub = args[0].lower() if args else "list"
+            if sub == "set" and len(args) >= 3:
+                key = args[1].strip()
+                val = " ".join(args[2:]).strip()
+                await self.memory_store.set_user_preference(key, val)
+                self.console.print(f"[{self.theme.ui_ok}]Saved preference:[/] {key}={val}")
+            elif sub in ("del", "rm", "delete") and len(args) >= 2:
+                removed = await self.memory_store.delete_user_preference(args[1])
+                self.console.print(f"Removed '{args[1]}'" if removed else f"Key '{args[1]}' not found")
+            elif sub == "clear":
+                count = await self.memory_store.clear_user_profile()
+                self.console.print(f"[dim]Cleared {count} profile preferences.[/dim]")
+            else:
+                prof = await self.memory_store.get_user_profile()
+                render_profile_table(self.console, prof, theme=self.theme)
+            return True
+
+        if cmd == "/btw":
+            question = raw_line.strip()[len(parts[0]):].strip()
+            await self._handle_btw(question)
+            return True
+
+        if cmd == "/rewind":
+            await self._handle_rewind(args)
+            return True
+
+        if cmd == "/palette":
+            return await self._run_command_palette()
 
         if cmd == "/gateway":
             tg_state = "configured" if self.config.telegram_token else "not set"
@@ -972,20 +1324,38 @@ class IvyCLIApp:
         def _on_token(chunk: str) -> None:
             nonlocal live
             chunks.append(chunk)
+            raw_stream = "".join(chunks)
+            if self.reasoning_mode in ("collapsed", "hide"):
+                visible, thinking = extract_thinking_blocks(raw_stream)
+                if not visible:
+                    if thinking and live is None:
+                        status.update(
+                            f"[{self.theme.ui_accent}]{self.theme.glyph} Reasoning ({len(thinking)} chars)...[/]"
+                        )
+                    return
+                display_text = visible
+            else:
+                visible, thinking = extract_thinking_blocks(raw_stream)
+                display_text = (
+                    f"> *Thinking:* {thinking.replace(chr(10), ' ')}\n\n{visible}".strip()
+                    if thinking
+                    else visible
+                )
+
             if live is None:
                 status.stop()
                 self.console.print()
                 self.console.print(rule)
                 self.console.print(f"[bold {self.theme.ui_accent}]{self.theme.glyph} Ivy[/]")
                 live = Live(
-                    Markdown("".join(chunks)),
+                    Markdown(display_text),
                     console=self.console,
                     refresh_per_second=12,
                     vertical_overflow="visible",
                 )
                 live.start()
             else:
-                live.update(Markdown("".join(chunks)))
+                live.update(Markdown(display_text))
 
         def _on_tool(ev: dict[str, Any]) -> None:
             nonlocal tool_events, hidden_tool_events
@@ -1030,12 +1400,31 @@ class IvyCLIApp:
                     self._usage_stats["api_calls"] += int(tu.get("api_calls", 0) or 0)
                     turn_tokens = int(tu.get("total_tokens", 0) or 0)
 
+            raw_final = reply.content or "".join(chunks)
+            visible_final, thought_final = extract_thinking_blocks(raw_final)
+            if thought_final:
+                self._last_reasoning = thought_final
+            final_render = (
+                raw_final
+                if self.reasoning_mode == "stream"
+                else (visible_final or raw_final)
+            )
             if live is not None:
-                live.update(Markdown(reply.content or "".join(chunks)))
+                live.update(Markdown(final_render))
                 _stop_live()
+                if thought_final and self.reasoning_mode == "collapsed":
+                    n_lines = len(thought_final.splitlines())
+                    self.console.print(
+                        f"[dim]∴ Thought ({n_lines} line{'s' if n_lines != 1 else ''} · /reasoning show)[/dim]"
+                    )
                 self.console.print(rule)
             else:
-                render_assistant_reply(self.console, reply.content or "", theme=self.theme)
+                if thought_final and self.reasoning_mode == "collapsed":
+                    n_lines = len(thought_final.splitlines())
+                    self.console.print(
+                        f"[dim]∴ Thought ({n_lines} line{'s' if n_lines != 1 else ''} · /reasoning show)[/dim]"
+                    )
+                render_assistant_reply(self.console, final_render, theme=self.theme)
 
             if hidden_tool_events > 0:
                 self.console.print(
@@ -1060,6 +1449,41 @@ class IvyCLIApp:
             _stop_live()
             self._active_status = None
 
+    def _handle_stash_trigger(self, draft: str) -> None:
+        """Stash a non-empty draft or pop the latest stashed draft into _pending_prefill."""
+        cleaned = draft.strip()
+        if cleaned:
+            self._prompt_stash.append(draft)
+            self.console.print(
+                f"[dim]📌 Stashed draft ({len(self._prompt_stash)} in stash · press Ctrl+S on empty line to restore).[/dim]"
+            )
+        elif self._prompt_stash:
+            self._pending_prefill = self._prompt_stash.pop()
+            self.console.print(
+                f"[dim]📌 Restored stashed draft ({len(self._prompt_stash)} remaining).[/dim]"
+            )
+        else:
+            self.console.print("[dim]Prompt stash is empty.[/dim]")
+
+    async def _maybe_offer_first_run_setup(self) -> None:
+        """Offer quick /setup when launching interactively with missing API credentials."""
+        if not self._can_open_picker():
+            return
+        provider = getattr(self.llm_client, "provider", "openai")
+        if provider in ("ollama", "vllm"):
+            return
+        api_key = self.llm_client._resolve_api_key(provider)
+        if (api_key and api_key != "missing-api-key") or self.config.effective_api_base:
+            return
+        self.console.print(
+            f"\n[{self.theme.ui_warn}]No API key or custom endpoint configured yet.[/]"
+        )
+        ans = await asyncio.to_thread(
+            lambda: input("Run /setup now? [Y/n]: ").strip().lower()
+        )
+        if ans in ("", "y", "yes"):
+            await self._handle_setup([])
+
     async def run_interactive(self) -> None:
         """Start interactive prompt_toolkit REPL with Hermes-inspired chrome."""
         await self._refresh_session_metadata()
@@ -1073,6 +1497,7 @@ class IvyCLIApp:
             session_title=self._session_title,
             git_branch=self._git_branch,
         )
+        await self._maybe_offer_first_run_setup()
         prompt_session = create_prompt_session(
             theme=self.theme,
             bottom_toolbar=self._render_toolbar,
@@ -1083,13 +1508,27 @@ class IvyCLIApp:
         self._prompt_session = prompt_session
 
         while True:
+            prefill = self._pending_prefill
+            self._pending_prefill = ""
             try:
-                user_input = await prompt_session.prompt_async(
-                    HTML(f"\n<prompt>{self.theme.prompt_symbol} </prompt>")
-                )
+                prompt_msg = HTML(f"\n<prompt>{self.theme.prompt_symbol} </prompt>")
+                if prefill:
+                    user_input = await prompt_session.prompt_async(prompt_msg, default=prefill)
+                else:
+                    user_input = await prompt_session.prompt_async(prompt_msg)
             except (EOFError, KeyboardInterrupt):
                 self.console.print(f"\n[dim]Exiting Ivy. {self.theme.glyph}[/dim]")
                 break
+
+            if user_input == "__IVY_PALETTE__":
+                keep = await self._run_command_palette()
+                if not keep:
+                    break
+                continue
+
+            if user_input.startswith("__IVY_STASH__:"):
+                self._handle_stash_trigger(user_input[len("__IVY_STASH__:"):])
+                continue
 
             if user_input.startswith("__IVY_EDITOR__:"):
                 draft = user_input[len("__IVY_EDITOR__:"):]
@@ -1153,6 +1592,18 @@ async def _run_async(args: argparse.Namespace) -> int:
             console.print(args.model_name or config.default_model)
             return 0
 
+        if args.command == "doctor":
+            findings = await run_doctor_checks(
+                config=config,
+                llm_client=llm,
+                memory_store=store,
+                skill_engine=skills,
+                live_probe=not getattr(args, "no_live", False),
+                fix=getattr(args, "fix", False),
+                env_path=".env",
+            )
+            return render_doctor_report(console, findings, theme=get_theme(config.default_theme))
+
         if args.command == "gateway":
             action = args.gateway_action or "status"
             gw_policy = SafetyApprovalPolicy(
@@ -1166,6 +1617,8 @@ async def _run_async(args: argparse.Namespace) -> int:
                 unattended=False,
                 skill_engine=skills,
                 approval_policy=gw_policy,
+                memory_store=store,
+                llm_client=llm,
             )
             agent = IvyAgent(
                 llm_client=llm,
@@ -1180,6 +1633,7 @@ async def _run_async(args: argparse.Namespace) -> int:
                 memory_store=store,
                 approval_policy=gw_policy,
             )
+            await cron.load_from_store()
             gw = GatewayServer(
                 agent=agent,
                 config=config,
@@ -1207,12 +1661,24 @@ async def _run_async(args: argparse.Namespace) -> int:
             interactive=True,
             unattended=False,
         )
+        todo_store = TodoStore()
+        target_session = args.session
+        if getattr(args, "continue_latest", False) and target_session == "cli:main":
+            latest = await store.get_latest_session_id()
+            if latest:
+                target_session = latest
+
+        session_holder = {"id": target_session}
         registry = build_default_tool_registry(
             config,
             interactive=True,
             unattended=False,
             skill_engine=skills,
             approval_policy=cli_policy,
+            memory_store=store,
+            llm_client=llm,
+            todo_store=todo_store,
+            session_id_getter=lambda: session_holder["id"],
         )
         agent = IvyAgent(
             llm_client=llm,
@@ -1222,11 +1688,12 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_generator=skill_gen,
             config=config,
         )
-        target_session = args.session
-        if getattr(args, "continue_latest", False) and target_session == "cli:main":
-            latest = await store.get_latest_session_id()
-            if latest:
-                target_session = latest
+        cli_cron = CronScheduler(
+            agent=agent,
+            memory_store=store,
+            approval_policy=cli_policy,
+        )
+        await cli_cron.load_from_store()
 
         app = IvyCLIApp(
             config=config,
@@ -1235,6 +1702,7 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_engine=skills,
             agent=agent,
             skill_generator=skill_gen,
+            cron_scheduler=cli_cron,
             session_id=target_session,
             console=console,
             theme_name=args.theme or config.default_theme,
@@ -1242,6 +1710,16 @@ async def _run_async(args: argparse.Namespace) -> int:
             approval_policy=cli_policy,
             history_path=Path.home() / ".ivy" / "history",
         )
+        app.todo_store = todo_store
+        todo_tool = registry.get("todo_list")
+        if isinstance(todo_tool, TodoListTool):
+            todo_tool.session_id_getter = lambda: app.session_id
+        delegate_tool = registry.get("delegate_task")
+        if isinstance(delegate_tool, DelegateTaskTool):
+            delegate_tool.session_id_getter = lambda: app.session_id
+        clarify_tool = registry.get("clarify")
+        if isinstance(clarify_tool, ClarifyTool):
+            clarify_tool.clarify_callback = app._interactive_clarify
         cli_policy.approval_callback = app._interactive_approval
         if args.command == "cron":
             await app.handle_slash_command("/cron list")

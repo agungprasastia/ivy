@@ -81,6 +81,14 @@ class MemoryStore:
                     output TEXT,
                     ran_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS cron_jobs (
+                    name TEXT PRIMARY KEY,
+                    cron_expr TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             # Lightweight schema migration for existing DBs missing sessions.title
@@ -413,6 +421,129 @@ class MemoryStore:
         async with self._lock:
             conn = self._ensure_conn()
             return UserProfileStore(conn).get_all()
+
+    async def delete_user_preference(self, key: str) -> bool:
+        """Remove a single preference from user_profile."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return UserProfileStore(conn).delete_preference(key)
+
+    async def clear_user_profile(self) -> int:
+        """Clear all user_profile preferences."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return UserProfileStore(conn).clear()
+
+    async def get_user_turns(self, session_id: str) -> list[dict[str, Any]]:
+        """List chronological user turn anchor rows {id, content, created_at} for /rewind."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT id, content, created_at
+                FROM messages
+                WHERE session_id = ? AND role = 'user'
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            return [
+                {"id": int(r[0]), "content": r[1], "created_at": r[2]}
+                for r in rows
+            ]
+
+    async def rewind_to_message_id(
+        self, session_id: str, message_id: int
+    ) -> tuple[str | None, int]:
+        """Delete messages from `message_id` onward in a session, keeping FTS synced."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND id = ?",
+                (session_id, message_id),
+            ).fetchone()
+            if row is None:
+                return None, 0
+            target_prompt = row[0]
+            cur = conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+                (session_id, message_id),
+            )
+            deleted = int(cur.rowcount or 0)
+            conn.execute("DELETE FROM messages_fts WHERE session_id = ?", (session_id,))
+            remaining = conn.execute(
+                """
+                SELECT role, content, created_at
+                FROM messages
+                WHERE session_id = ? AND exclude_from_fts = 0 AND content != ''
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            for r_role, r_content, r_ts in remaining:
+                conn.execute(
+                    "INSERT INTO messages_fts (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                    (session_id, r_role, r_content, r_ts),
+                )
+            conn.commit()
+            return target_prompt, deleted
+
+    async def save_cron_job(
+        self, name: str, cron_expr: str, prompt: str, enabled: bool = True
+    ) -> None:
+        """Persist a scheduled cron job in SQLite."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO cron_jobs (name, cron_expr, prompt, enabled, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    cron_expr = excluded.cron_expr,
+                    prompt = excluded.prompt,
+                    enabled = excluded.enabled
+                """,
+                (name, cron_expr, prompt, 1 if enabled else 0, now),
+            )
+            conn.commit()
+
+    async def delete_cron_job(self, name: str) -> bool:
+        """Delete a persisted cron job by name."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute("DELETE FROM cron_jobs WHERE name = ?", (name,))
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def set_cron_job_enabled(self, name: str, enabled: bool) -> bool:
+        """Enable or disable a persisted cron job."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute(
+                "UPDATE cron_jobs SET enabled = ? WHERE name = ?",
+                (1 if enabled else 0, name),
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def list_cron_jobs(self) -> list[dict[str, Any]]:
+        """List all persisted cron jobs ordered by name."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT name, cron_expr, prompt, enabled, created_at FROM cron_jobs ORDER BY name ASC"
+            ).fetchall()
+            return [
+                {
+                    "name": row[0],
+                    "cron_expr": row[1],
+                    "prompt": row[2],
+                    "enabled": bool(row[3]),
+                    "created_at": row[4],
+                }
+                for row in rows
+            ]
 
     async def log_cron_run(self, task_name: str, status: str, output: str = "") -> None:
         """Record a background cron execution in SQLite."""

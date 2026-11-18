@@ -55,3 +55,25 @@ async def test_cron_scheduler_executes_due_task_and_dispatches(tmp_path):
     assert delivered == [("telegram", "12345", "Daily summary ready")]
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cron_scheduler_persistence_and_pause_resume(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "cron_persist.db"))
+    await store.initialize()
+    await store.save_cron_job("morning", "0 9 * * *", "Give morning briefing", enabled=True)
+    await store.save_cron_job("paused-job", "*/5 * * * *", "Check ping", enabled=False)
+
+    scheduler = CronScheduler(memory_store=store)
+    loaded = await scheduler.load_from_store()
+    assert loaded == 2
+    assert scheduler.pause_task("morning") is True
+    assert {t.name: t.enabled for t in scheduler.list_tasks()}["morning"] is False
+    assert scheduler.resume_task("morning") is True
+    assert {t.name: t.enabled for t in scheduler.list_tasks()}["morning"] is True
+
+    assert await store.set_cron_job_enabled("morning", False) is True
+    assert await store.delete_cron_job("paused-job") is True
+    remaining = await store.list_cron_jobs()
+    assert len(remaining) == 1 and remaining[0]["enabled"] is False
+    await store.close()

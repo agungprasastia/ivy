@@ -307,3 +307,43 @@ def export_session_json(
         "messages": [msg.model_dump(mode="json") for msg in messages],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+_CLOSED_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning_scratchpad)\b[^>]*>(.*?)</\1>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+_OPEN_THINK_RE = re.compile(
+    r"<(think|thinking|reasoning_scratchpad)\b[^>]*>(.*)$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_thinking_blocks(text: str) -> tuple[str, str]:
+    """Strip completed and in-progress <think>/<thinking> blocks cleanly.
+
+    Returns:
+        (visible_text, collected_thinking_text)
+    """
+    if not text:
+        return "", ""
+
+    thoughts: list[str] = []
+
+    def _collect_closed(match: re.Match[str]) -> str:
+        inner = match.group(2).strip()
+        if inner:
+            thoughts.append(inner)
+        return ""
+
+    cleaned = _CLOSED_THINK_RE.sub(_collect_closed, text)
+
+    open_match = _OPEN_THINK_RE.search(cleaned)
+    if open_match:
+        trailing = open_match.group(2).strip()
+        if trailing:
+            thoughts.append(trailing)
+        cleaned = cleaned[: open_match.start()]
+
+    return cleaned.strip(), "\n\n".join(thoughts).strip()
+

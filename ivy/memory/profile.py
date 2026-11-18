@@ -36,3 +36,13 @@ class UserProfileStore:
             "SELECT key, value FROM user_profile ORDER BY key"
         ).fetchall()
         return {row[0]: row[1] for row in rows}
+
+    def delete_preference(self, key: str) -> bool:
+        cur = self.conn.execute("DELETE FROM user_profile WHERE key = ?", (key,))
+        self.conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    def clear(self) -> int:
+        cur = self.conn.execute("DELETE FROM user_profile")
+        self.conn.commit()
+        return int(cur.rowcount or 0)

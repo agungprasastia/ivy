@@ -203,6 +203,11 @@ def render_tool_event(
 
         if meta and meta.get("diff"):
             _render_inline_diff(console, str(meta["diff"]), t)
+        elif name == "todo_list" and meta and isinstance(meta.get("todos"), list):
+            markers = {"completed": f"[{t.ui_ok}]✓[/]", "in_progress": f"[{t.ui_accent}]▸[/]", "pending": "[dim]·[/dim]", "cancelled": "[dim]~[/dim]"}
+            for item in meta["todos"][:8]:
+                m = markers.get(item.get("status", "pending"), "·")
+                console.print(f"    {m} [dim]#{escape(str(item.get('id', '')))}[/] {escape(str(item.get('content', '')))}")
 
         if display_mode == "verbose":
             detail = (event.get("error") or event.get("output") or "").strip()
@@ -273,32 +278,26 @@ def render_help_table(
     table.add_column("Command", style=f"bold {t.ui_label}")
     table.add_column("Description")
     rows = [
-        ("/session [list|<id|#>]", "List saved sessions or switch by ID / row #"),
+        ("/session | /resume", "Interactive session switcher (Ctrl+N new, Del remove)"),
         ("/new [name]", "Start a fresh session (alias: /reset)"),
-        ("/fork [name]", "Clone current session to a new branch (alias: /branch)"),
-        ("/title [name]", "Set or view current session title"),
-        ("/undo", "Remove last user turn + reply from history"),
-        ("/retry", "Undo last turn and re-send last prompt"),
-        ("/history [N]", "Show recent session turns with timestamps"),
-        ("/save [md|json] [file]", "Export conversation transcript to file"),
-        ("/copy [N]", "Copy last (or Nth-last) assistant reply to clipboard"),
-        ("/status", "Inspect active session, context, model & approval state"),
-        ("/context", "Visual token breakdown across prompt, tools & history"),
-        ("/usage", "Show session API calls and token consumption"),
-        ("/compact [focus]", "Summarize older turns cleanly (alias: /compress)"),
-        ("/diff [--stat]", "Inspect git workspace changes"),
-        ("/verbose [mode]", "Set tool detail: compact | verbose | focus"),
-        ("/focus [on|off]", "Toggle distraction-free view (hides tool chatter)"),
-        ("/yolo", "Toggle session dangerous-command auto-approval"),
-        ("/prompt", "Compose prompt in $EDITOR (shortcut: Ctrl+G)"),
+        ("/fork [name] | /rewind [N]", "Branch session or roll back to an earlier user prompt"),
+        ("/title [name] | /history [N]", "Set session title or show turns with timestamps"),
+        ("/undo | /retry", "Remove last turn or undo & re-send last prompt"),
+        ("/save [md|json] | /copy [N]", "Export session or copy assistant reply to clipboard"),
+        ("/status | /context | /usage", "Inspect session state, token meter & API usage"),
+        ("/compact [focus] | /btw <q>", "Summarize older turns or ask off-record side question"),
+        ("/diff [--stat] | /doctor [--fix]", "Inspect workspace diff or diagnose Ivy install"),
+        ("/reasoning [mode] | /verbose [mode]", "Control <think> display or tool detail (compact/verbose/focus)"),
+        ("/focus [on|off] | /yolo", "Distraction-free view or session auto-approve toggle"),
+        ("/todo [clear] | /profile [list|set]", "View session task checklist or long-term preferences"),
+        ("/cron list|add|pause|resume|remove", "Manage persisted scheduled background tasks"),
         ("/skills list|inspect|remove|reflect", "Manage and synthesize skills"),
         ("/memory <query>", "Search conversation history via SQLite FTS5"),
         ("/setup [base] [key] [model]", "Configure API endpoint/key & save to .env"),
-        ("/model [name]", "Show active model or switch & save to .env"),
-        ("/theme [name]", "Switch & save TUI theme (ivy, hermes, ocean)"),
-        ("/cron list | /gateway status", "Inspect background cron jobs & gateways"),
+        ("/model [name] | /theme [name]", "Pick/switch active model or TUI skin"),
+        ("/palette (Ctrl+P) | /prompt (Ctrl+G)", "Fuzzy command palette or compose in $EDITOR"),
+        ("Ctrl+S  |  !<cmd>  |  @file/@diff", "Stash/restore draft · local shell (0 tok) · attach context"),
         ("/clear | /exit", "Clear current session or exit Ivy"),
-        ("!<cmd>  ·  @file / @diff", "Run local shell (0 tokens) · Attach files/git diff"),
     ]
     for cmd, desc in rows:
         table.add_row(cmd, desc)
@@ -566,3 +565,58 @@ def render_diff_output(
             console.print(escape(ln))
     if len(lines) > 120:
         console.print(f"[dim]… truncated ({len(lines) - 120} more lines)[/dim]")
+
+
+def render_todo_panel(
+    console: Console,
+    todos: list[dict[str, str]],
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display session task checklist in a compact Rich Panel."""
+    t = theme or get_theme()
+    if not todos:
+        console.print("[dim]Task checklist is empty.[/dim]")
+        return
+    markers = {
+        "completed": f"[{t.ui_ok}]✓[/]",
+        "in_progress": f"[{t.ui_accent}]▸[/]",
+        "pending": "[dim]·[/dim]",
+        "cancelled": "[dim]~[/dim]",
+    }
+    lines = [
+        f"{markers.get(item.get('status', 'pending'), '·')} "
+        f"[bold]#{escape(item.get('id', ''))}[/bold] {escape(item.get('content', ''))} "
+        f"[dim]({escape(item.get('status', 'pending'))})[/dim]"
+        for item in todos
+    ]
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold {t.banner_title}]{t.glyph} Task Checklist[/]",
+            border_style=t.banner_border,
+            box=box.ROUNDED,
+            expand=False,
+        )
+    )
+
+
+def render_profile_table(
+    console: Console,
+    profile: dict[str, str],
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display persistent user profile preferences."""
+    t = theme or get_theme()
+    if not profile:
+        console.print("[dim]No saved user preferences yet (/profile set <key> <value>).[/dim]")
+        return
+    table = Table(
+        title=f"[{t.banner_title}]User Profile Memory[/]",
+        box=box.ROUNDED,
+        border_style=t.banner_border,
+    )
+    table.add_column("Key", style=f"bold {t.ui_label}")
+    table.add_column("Value")
+    for k, v in sorted(profile.items()):
+        table.add_row(escape(k), escape(v))
+    console.print(table)

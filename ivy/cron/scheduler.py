@@ -51,6 +51,43 @@ class CronScheduler:
         """Alias for remove_task."""
         return self.remove_task(name)
 
+    def pause_task(self, name: str) -> bool:
+        """Disable a scheduled task without removing it."""
+        task = self._tasks.get(name)
+        if task is None:
+            return False
+        task.enabled = False
+        return True
+
+    def resume_task(self, name: str) -> bool:
+        """Re-enable a paused scheduled task and recompute its next run."""
+        task = self._tasks.get(name)
+        if task is None:
+            return False
+        task.enabled = True
+        task.next_run = task.compute_next_run()
+        return True
+
+    async def load_from_store(self) -> int:
+        """Hydrate persisted cron_jobs from MemoryStore into the active scheduler."""
+        if self.memory_store is None:
+            return 0
+        jobs = await self.memory_store.list_cron_jobs()
+        loaded = 0
+        for j in jobs:
+            try:
+                task = ScheduledTask(
+                    name=j["name"],
+                    cron_expr=j["cron_expr"],
+                    prompt=j["prompt"],
+                    enabled=bool(j.get("enabled", True)),
+                )
+                self._tasks[task.name] = task
+                loaded += 1
+            except Exception as exc:
+                logger.warning("Skipping invalid stored cron job %s: %s", j.get("name"), exc)
+        return loaded
+
     def list_tasks(self) -> list[ScheduledTask]:
         """Return all registered scheduled tasks."""
         return list(self._tasks.values())

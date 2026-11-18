@@ -617,3 +617,117 @@ async def test_interactive_picker_state_session_completion_and_picker_flow(tmp_p
     assert app.session_id == "cli:other"
     assert {s["session_id"] for s in await store.list_sessions()} == {"cli:other"}
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_phase2_think_folding_doctor_btw_rewind_stash_and_cron_crud(tmp_path):
+    from io import StringIO
+    from unittest.mock import patch
+    from rich.console import Console
+    from ivy.tools.todo import TodoStore
+    from ivy.tui.doctor import run_doctor_checks
+    from ivy.tui.helpers import extract_thinking_blocks
+
+    # 1. Thinking block extraction (closed + streaming open tag)
+    vis1, th1 = extract_thinking_blocks("<think>step 1\nstep 2</think>\nFinal answer!")
+    assert vis1 == "Final answer!"
+    assert "step 1" in th1
+    vis2, th2 = extract_thinking_blocks("<think>still thinking...")
+    assert vis2 == ""
+    assert "still thinking..." in th2
+
+    # 2. Setup app with MemoryStore + Mock LLM/Agent
+    env_file = tmp_path / ".env"
+    skills_dir = tmp_path / "missing_skills"
+    cfg = IvyConfig(db_path=str(tmp_path / "p2_cli.db"), skills_dir=str(skills_dir))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="turn 1"))
+    await store.save_message("cli:main", ChatMessage(role=Role.ASSISTANT, content="reply 1"))
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="turn 2"))
+    await store.save_message("cli:main", ChatMessage(role=Role.ASSISTANT, content="reply 2"))
+
+    skills = SkillEngine(skills_dir=str(skills_dir))
+    llm = LLMClient(cfg)
+    mock_agent = MagicMock()
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=110)
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        console=console,
+        env_path=env_file,
+    )
+
+    # 3. Doctor --fix creates missing .env and skills directory
+    findings = await run_doctor_checks(
+        cfg, llm, store, skills, live_probe=False, fix=True, env_path=env_file
+    )
+    assert env_file.is_file() and skills_dir.is_dir()
+    assert any(f.name == "SQLite & FTS5" and f.status == "ok" for f in findings)
+    assert await app.handle_slash_command("/doctor --no-live") is True
+    assert "Ivy Doctor Diagnostics" in buf.getvalue()
+
+    # 4. Reasoning mode & streaming <think> folding
+    assert await app.handle_slash_command("/reasoning collapsed") is True
+
+    async def fake_think_turn(**kwargs):
+        cb = kwargs["stream_callback"]
+        cb("<think>secret thought</think>\nClean visible output")
+        return ChatMessage(role=Role.ASSISTANT, content="<think>secret thought</think>\nClean visible output")
+
+    mock_agent.run_turn = AsyncMock(side_effect=fake_think_turn)
+    await app._run_turn_with_live_stream("test think")
+    assert "Clean visible output" in buf.getvalue()
+    assert app._last_reasoning == "secret thought"
+    assert await app.handle_slash_command("/reasoning show") is True
+    assert "secret thought" in buf.getvalue()
+
+    # 5. /btw runs off-record without persisting to MemoryStore
+    before_count = len(await store.get_messages("cli:main"))
+    with patch.object(
+        llm, "chat_completion", new=AsyncMock(return_value=ChatMessage(role=Role.ASSISTANT, content="Side info!"))
+    ):
+        assert await app.handle_slash_command("/btw what time?") is True
+    assert len(await store.get_messages("cli:main")) == before_count
+    assert "Side info!" in buf.getvalue()
+
+    # 6. /profile set/list/clear & /todo
+    assert await app.handle_slash_command("/profile set editor vscode") is True
+    assert (await store.get_user_profile())["editor"] == "vscode"
+    assert await app.handle_slash_command("/profile list") is True
+    assert await app.handle_slash_command("/profile clear") is True
+    assert await store.get_user_profile() == {}
+
+    app.todo_store = TodoStore()
+    app.todo_store.write("cli:main", [{"content": "Ship Phase 2", "status": "in_progress"}])
+    assert await app.handle_slash_command("/todo") is True
+    assert "Ship Phase 2" in buf.getvalue()
+
+    # 7. /rewind 1 rolls back turns and prefills turn #1 prompt
+    assert await app.handle_slash_command("/rewind 1") is True
+    assert app._pending_prefill == "turn 1"
+    assert await store.get_messages("cli:main") == []
+
+    # 8. Ctrl+S prompt stash push & pop
+    app._handle_stash_trigger("unfinished draft prompt")
+    app._pending_prefill = ""
+    app._handle_stash_trigger("")
+    assert app._pending_prefill == "unfinished draft prompt"
+
+    # 9. /cron add, pause, resume, remove persisted to SQLite
+    assert await app.handle_slash_command('/cron add nightly "0 2 * * *" "Check builds"') is True
+    assert len(app.cron_scheduler.list_tasks()) == 1
+    assert (await store.list_cron_jobs())[0]["name"] == "nightly"
+    assert await app.handle_slash_command("/cron pause nightly") is True
+    assert (await store.list_cron_jobs())[0]["enabled"] is False
+    assert await app.handle_slash_command("/cron resume nightly") is True
+    assert (await store.list_cron_jobs())[0]["enabled"] is True
+    assert await app.handle_slash_command("/cron remove nightly") is True
+    assert await store.list_cron_jobs() == []
+
+    await store.close()

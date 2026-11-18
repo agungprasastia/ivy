@@ -24,11 +24,13 @@ if TYPE_CHECKING:
 
 SLASH_COMMANDS = [
     "/setup",
+    "/doctor",
     "/model",
     "/session",
     "/resume",
     "/new",
     "/fork",
+    "/rewind",
     "/title",
     "/undo",
     "/retry",
@@ -39,11 +41,16 @@ SLASH_COMMANDS = [
     "/context",
     "/usage",
     "/compact",
+    "/btw",
     "/diff",
+    "/reasoning",
     "/verbose",
     "/focus",
     "/yolo",
+    "/todo",
+    "/profile",
     "/prompt",
+    "/palette",
     "/skills",
     "/gateway",
     "/cron",
@@ -56,11 +63,13 @@ SLASH_COMMANDS = [
 
 SLASH_COMMAND_META: dict[str, str] = {
     "/setup": "Configure API base URL, API key, and default model (.env)",
+    "/doctor": "Diagnose runtime, endpoint, DB, skills & tools (--fix)",
     "/model": "Switch or inspect active LLM model (persisted to .env)",
-    "/session": "List saved sessions or switch by ID / #",
+    "/session": "List or pick saved sessions interactively",
     "/resume": "Alias for /session — resume saved session",
     "/new": "Start a new fresh session",
     "/fork": "Fork current session into a new branch",
+    "/rewind": "Pick an earlier user turn to roll back / re-run / fork",
     "/title": "Set or view current session title",
     "/undo": "Undo last user turn + assistant reply",
     "/retry": "Undo last turn and re-send last prompt",
@@ -71,14 +80,19 @@ SLASH_COMMAND_META: dict[str, str] = {
     "/context": "Inspect token breakdown across prompt, tools & history",
     "/usage": "Show session API calls and token totals",
     "/compact": "Summarize older turns via LLM to save context",
+    "/btw": "Ask a quick side question without polluting session history",
     "/diff": "Inspect git diff in current workspace",
+    "/reasoning": "Control <think> display (collapsed | stream | hide | show)",
     "/verbose": "Set tool output mode (compact | verbose | focus)",
     "/focus": "Toggle distraction-free view (hides tool lines)",
     "/yolo": "Toggle session dangerous-command auto-approval",
+    "/todo": "Inspect or clear current session task checklist",
+    "/profile": "View or edit persistent cross-session user preferences",
     "/prompt": "Compose multiline prompt in $EDITOR (Ctrl+G)",
+    "/palette": "Open interactive command palette (Ctrl+P)",
     "/skills": "List, inspect, remove, or reflect skills",
     "/gateway": "Show Telegram/Discord gateway status",
-    "/cron": "List scheduled cron tasks",
+    "/cron": "Manage scheduled cron tasks (list|add|pause|resume|remove)",
     "/memory": "Search past sessions via SQLite FTS5",
     "/theme": "Switch TUI skin (ivy, hermes, ocean)",
     "/clear": "Clear current session history",
@@ -92,6 +106,25 @@ _SUBCOMMAND_META: dict[str, dict[str, str]] = {
     },
     "/resume": {
         "list": "List saved sessions",
+    },
+    "/doctor": {
+        "--fix": "Create missing .env / skills directory automatically",
+        "--no-live": "Skip HTTP endpoint connectivity probe",
+    },
+    "/reasoning": {
+        "collapsed": "Hide <think> tags and show compact duration/line count",
+        "stream": "Show <think> text dimmed during streaming",
+        "hide": "Suppress <think> summary completely",
+        "show": "Inspect the last hidden reasoning block",
+    },
+    "/todo": {
+        "list": "Show active task checklist",
+        "clear": "Clear checklist for this session",
+    },
+    "/profile": {
+        "list": "List saved cross-session preferences",
+        "set": "Set preference: /profile set <key> <value>",
+        "clear": "Clear all saved preferences",
     },
     "/verbose": {
         "compact": "Concise tool lines + inline diffs (default)",
@@ -123,6 +156,10 @@ _SUBCOMMAND_META: dict[str, dict[str, str]] = {
     },
     "/cron": {
         "list": "List scheduled cron tasks",
+        "add": "Add cron job: /cron add <name> \"<expr>\" <prompt>",
+        "pause": "Pause a cron job by name",
+        "resume": "Resume a paused cron job",
+        "remove": "Delete a cron job by name",
     },
 }
 
@@ -305,7 +342,7 @@ def build_prompt_style(theme: ThemeConfig | None = None) -> Style:
 
 
 def build_prompt_key_bindings() -> KeyBindings:
-    """Build multiline + $EDITOR keybindings for PromptSession."""
+    """Build multiline, $EDITOR, palette (Ctrl+P), and stash (Ctrl+S) keybindings."""
     kb = KeyBindings()
 
     @kb.add("escape", "enter")
@@ -317,6 +354,15 @@ def build_prompt_key_bindings() -> KeyBindings:
     def _open_external_editor(event) -> None:
         buf = event.current_buffer
         event.app.exit(result=f"__IVY_EDITOR__:{buf.text}")
+
+    @kb.add("c-p")
+    def _open_palette(event) -> None:
+        event.app.exit(result="__IVY_PALETTE__")
+
+    @kb.add("c-s")
+    def _stash_draft(event) -> None:
+        buf = event.current_buffer
+        event.app.exit(result=f"__IVY_STASH__:{buf.text}")
 
     return kb
 

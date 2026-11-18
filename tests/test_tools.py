@@ -281,3 +281,86 @@ async def test_file_tools_emit_diff_metadata_and_approval_session_feedback(tmp_p
     res_rej = await term.execute(command="rm -rf /tmp/danger")
     assert res_rej.status == "rejected"
     assert "Use pytest instead of rm" in (res_rej.error or "")
+
+
+@pytest.mark.asyncio
+async def test_phase2_tools_todo_clarify_delegate_and_profile(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+    from ivy.core.subagent import SubagentRunner
+    from ivy.core.types import ChatMessage, Role
+    from ivy.memory.store import MemoryStore
+    from ivy.tools.clarify import ClarifyTool, mark_recommended, strip_recommended
+    from ivy.tools.delegate import DelegateTaskTool
+    from ivy.tools.profile import RememberPreferenceTool
+    from ivy.tools.todo import TodoListTool, TodoStore
+
+    # 1. TodoListTool write, merge, and read
+    t_store = TodoStore()
+    todo = TodoListTool(store=t_store, session_id_getter=lambda: "cli:t1")
+    r_write = await todo.execute(
+        todos=[
+            {"id": "1", "content": "Inspect code", "status": "in_progress"},
+            {"id": "2", "content": "Write tests", "status": "pending"},
+        ]
+    )
+    assert r_write.status == "success"
+    assert "[>] #1: Inspect code" in r_write.output
+
+    r_merge = await todo.execute(
+        todos=[{"id": "1", "content": "", "status": "completed"}],
+        merge=True,
+    )
+    assert "[x] #1: Inspect code" in r_merge.output
+    r_read = await todo.execute()
+    assert len(r_read.metadata["todos"]) == 2
+
+    # 2. ClarifyTool recommended markers & scoped callback
+    marked = mark_recommended(["SQLite", "Postgres"])
+    assert marked[0] == "SQLite (Recommended)"
+    assert strip_recommended("SQLite (Recommended)") == "SQLite"
+
+    clarify = ClarifyTool()
+    err_res = await clarify.execute(questions=[{"question": "Pick DB?"}])
+    assert err_res.status == "error"
+
+    async def fake_clarify(question: str, choices: list[str], multi: bool):
+        assert choices[0].endswith("(Recommended)")
+        return choices[0]
+
+    async with clarify.scoped_context(fake_clarify):
+        ok_res = await clarify.execute(
+            questions=[{"question": "Which DB?", "choices": ["SQLite", "Postgres"]}]
+        )
+    assert ok_res.status == "success"
+    assert '"answer": "SQLite"' in ok_res.output
+
+    # 3. DelegateTaskTool single & parallel batch + recursion block
+    store = MemoryStore(db_path=str(tmp_path / "tools_p2.db"))
+    await store.initialize()
+
+    mock_llm = MagicMock()
+    mock_llm.chat_completion = AsyncMock(
+        return_value=ChatMessage(role=Role.ASSISTANT, content="Subtask done")
+    )
+    reg = ToolRegistry()
+    reg.register(clarify)
+    runner = SubagentRunner(llm_client=mock_llm, tool_registry=reg, memory_store=store, max_iterations=2)
+    delegate = DelegateTaskTool(runner=runner, session_id_getter=lambda: "cli:parent")
+    reg.register(delegate)
+
+    assert delegate._safe_child_tools(None) == []  # clarify & delegate_task blocked from child
+    single = await delegate.execute(task="Check module A")
+    assert single.status == "success"
+    assert "Subtask done" in single.output
+
+    batch = await delegate.execute(tasks=["Task 1", "Task 2"])
+    assert batch.status == "success"
+    assert batch.metadata["task_count"] == 2
+    assert "Subtask 1:" in batch.output and "Subtask 2:" in batch.output
+
+    # 4. RememberPreferenceTool
+    pref = RememberPreferenceTool(memory_store=store)
+    p_res = await pref.execute(key="lang", value="id")
+    assert p_res.status == "success"
+    assert (await store.get_user_profile())["lang"] == "id"
+    await store.close()

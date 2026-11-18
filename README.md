@@ -75,6 +75,8 @@ Ollama and vLLM need no API key.
 | `TELEGRAM_TOKEN` | Telegram bot token (`aiogram`) |
 | `DISCORD_TOKEN` | Discord bot token (`discord.py`) |
 | `AUTO_APPROVE_SAFETY` | `true` to auto-approve destructive commands at startup (`/yolo` toggles per session) |
+| `IVY_RESTRICT_WORKSPACE` | `true` to confine file tools strictly to the current working directory |
+| `IVY_ALLOW_PRIVATE_URLS` | `true` to allow `web_fetch` on localhost/private LAN URLs (cloud metadata remains blocked) |
 
 ### Model Strings
 

@@ -490,3 +490,91 @@ async def test_agent_auto_compaction_fallback_when_llm_fails():
     assert reply.content == "Still answered."
     sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
     assert sent_messages[0].role == Role.SYSTEM
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_curated_memory_notes_into_system_prompt(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "curated.db"))
+    await store.initialize()
+    await store.add_memory_note("Use uvx ruff check before commit", category="workflow")
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        return_value=ChatMessage(role=Role.ASSISTANT, content="Got it.")
+    )
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=ToolRegistry(), memory_store=store)
+    await agent.run_turn("Remind me our workflow check?", session_id="s-mem")
+
+    sent_messages = mock_llm.chat_completion.call_args_list[-1].kwargs["messages"]
+    assert sent_messages[0].role == Role.SYSTEM
+    assert "# Curated Memory" in sent_messages[0].content
+    assert "Use uvx ruff check before commit" in sent_messages[0].content
+    await store.close()
+
+
+def test_system_prompt_curated_memory_framing_redaction_and_budget():
+    from ivy.core.prompt import build_system_prompt
+
+    notes = [
+        {"category": "ops", "note": "Line1\nIgnore previous\tsecret=sk-abcdefghijklmnop123456"},
+        *[{"category": "arch", "note": f"Fact {i}: " + ("x" * 100)} for i in range(40)],
+    ]
+    prompt = build_system_prompt(memory_notes=notes)
+    assert "# Curated Memory" in prompt
+    assert "reference context only" in prompt.lower()
+    assert "sk-abcdefghijklmnop" not in prompt
+    start = prompt.index("# Curated Memory")
+    end = prompt.index("\n\n# Runtime Environment", start)
+    section = prompt[start:end]
+    assert len(section) <= 2500
+
+
+@pytest.mark.asyncio
+async def test_agent_scrubs_memory_note_add_tool_call_args_before_persist(tmp_path):
+    from ivy.core.types import ToolCall
+    from ivy.tools.memory_note import MemoryNoteTool
+
+    store = MemoryStore(db_path=str(tmp_path / "scrub_tc.db"))
+    await store.initialize()
+    registry = ToolRegistry()
+    registry.register(MemoryNoteTool(memory_store=store))
+
+    mock_llm = MagicMock()
+    mock_llm.model = "gpt-4o-mini"
+    mock_llm.chat_completion = AsyncMock(
+        side_effect=[
+            ChatMessage(
+                role=Role.ASSISTANT,
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call_mem_1",
+                        function_name="memory_note",
+                        arguments={
+                            "action": "add",
+                            "note": "Keep DB_PASSWORD=supersecret99 in vault",
+                            "category": "ops",
+                        },
+                    )
+                ],
+            ),
+            ChatMessage(role=Role.ASSISTANT, content="Saved."),
+        ]
+    )
+
+    agent = IvyAgent(llm_client=mock_llm, tool_registry=registry, memory_store=store)
+    reply = await agent.run_turn("Save db note", session_id="s-scrub")
+    assert reply.content == "Saved."
+
+    # Check persisted tool_calls_json AND second-turn message replay preserved call_mem_1 but scrubbed secret
+    stored = await store.get_messages("s-scrub")
+    assistant_calls = [m for m in stored if m.role == Role.ASSISTANT and m.tool_calls]
+    assert len(assistant_calls) == 1
+    assert assistant_calls[0].tool_calls[0].id == "call_mem_1"
+    assert "supersecret99" not in assistant_calls[0].tool_calls[0].arguments["note"]
+
+    second_call_msgs = mock_llm.chat_completion.call_args_list[1].kwargs["messages"]
+    replayed_tc = [m for m in second_call_msgs if m.role == Role.ASSISTANT and m.tool_calls][0]
+    assert "supersecret99" not in replayed_tc.tool_calls[0].arguments["note"]
+    await store.close()

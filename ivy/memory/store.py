@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ivy.core.prompt import redact_secrets
 from ivy.core.types import ChatMessage, Role, ToolCall
 from ivy.memory.context import ContextWindowManager
 from ivy.memory.fts import search_messages_fts
 from ivy.memory.profile import UserProfileStore
+from ivy.skills.guard import check_prompt_safety
 
 
 class MemoryStore:
@@ -37,6 +39,11 @@ class MemoryStore:
             if self.db_path != ":memory:":
                 Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.create_function(
+                "ivy_casefold",
+                1,
+                lambda val: str(val).casefold() if val is not None else "",
+            )
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.executescript(
@@ -88,6 +95,13 @@ class MemoryStore:
                     prompt TEXT NOT NULL,
                     enabled INTEGER DEFAULT 1,
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    note TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL DEFAULT 'general',
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -555,6 +569,155 @@ class MemoryStore:
                 (task_name, status, output, now),
             )
             conn.commit()
+
+    MAX_MEMORY_NOTES = 50
+    MAX_MEMORY_NOTE_CHARS = 300
+
+    @staticmethod
+    def _normalize_category(category: str | None) -> str:
+        """Collapse whitespace, redact secrets, clip to 40 chars, and default to general."""
+        collapsed = " ".join((category or "").split()).strip()
+        if not collapsed:
+            return "general"
+        redacted = " ".join(redact_secrets(collapsed).split()).strip()
+        clipped = redacted[:40].strip()
+        return clipped or "general"
+
+    async def add_memory_note(
+        self, note: str, category: str = "general"
+    ) -> dict[str, Any]:
+        """Add or refresh a curated persistent memory note (security-checked & scrubbed)."""
+        unsafe_reason = check_prompt_safety(note) or check_prompt_safety(category)
+        if unsafe_reason is not None:
+            raise ValueError(unsafe_reason)
+        scrubbed = redact_secrets(note or "")
+        cleaned = " ".join(scrubbed.split()).strip()
+        if not cleaned:
+            raise ValueError("Memory note must not be empty.")
+        if len(cleaned) > self.MAX_MEMORY_NOTE_CHARS:
+            raise ValueError(
+                f"Memory note exceeds {self.MAX_MEMORY_NOTE_CHARS} characters "
+                f"({len(cleaned)}). Keep notes concise."
+            )
+        clean_cat = self._normalize_category(category)
+        now = datetime.now(timezone.utc).isoformat()
+
+        async with self._lock:
+            conn = self._ensure_conn()
+            try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT id FROM memory_notes WHERE note = ?",
+                    (cleaned,),
+                ).fetchone()
+                if existing is None:
+                    count_row = conn.execute("SELECT COUNT(*) FROM memory_notes").fetchone()
+                    total = int(count_row[0]) if count_row else 0
+                    if total >= self.MAX_MEMORY_NOTES:
+                        raise ValueError(
+                            f"Memory note limit reached ({self.MAX_MEMORY_NOTES}). Remove an old note first."
+                        )
+                    cur = conn.execute(
+                        "INSERT INTO memory_notes (note, category, updated_at) VALUES (?, ?, ?)",
+                        (cleaned, clean_cat, now),
+                    )
+                    note_id = int(cur.lastrowid or 0)
+                else:
+                    note_id = int(existing[0])
+                    conn.execute(
+                        "UPDATE memory_notes SET category = ?, updated_at = ? WHERE id = ?",
+                        (clean_cat, now, note_id),
+                    )
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            return {
+                "id": note_id,
+                "note": cleaned,
+                "category": clean_cat,
+                "updated_at": now,
+            }
+
+    async def list_memory_notes(
+        self, category: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List curated memory notes in deterministic insertion order."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            if category and category.strip():
+                norm_cat = self._normalize_category(category)
+                rows = conn.execute(
+                    """
+                    SELECT id, note, category, updated_at
+                    FROM memory_notes
+                    WHERE ivy_casefold(category) = ivy_casefold(?)
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (norm_cat, max(1, limit)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, note, category, updated_at
+                    FROM memory_notes
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (max(1, limit),),
+                ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "note": r[1],
+                    "category": r[2],
+                    "updated_at": r[3],
+                }
+                for r in rows
+            ]
+
+    async def search_memory_notes(
+        self, query: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Search curated memory notes and categories using Unicode case-insensitive matching."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        escaped = q.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped}%"
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT id, note, category, updated_at
+                FROM memory_notes
+                WHERE ivy_casefold(note) LIKE ? ESCAPE '\\'
+                   OR ivy_casefold(category) LIKE ? ESCAPE '\\'
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (like, like, max(1, limit)),
+            ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "note": r[1],
+                    "category": r[2],
+                    "updated_at": r[3],
+                }
+                for r in rows
+            ]
+
+    async def remove_memory_note(self, note_id: int) -> bool:
+        """Delete a curated memory note by ID."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            cur = conn.execute("DELETE FROM memory_notes WHERE id = ?", (int(note_id),))
+            conn.commit()
+            return (cur.rowcount or 0) > 0
 
     def compress_context(
         self, messages: list[ChatMessage], max_messages: int | None = None

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from ivy.core.types import ToolResult
 from ivy.skills.format import SkillDefinition
+from ivy.skills.guard import format_scan_rejection, scan_skill_content
 from ivy.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -85,13 +86,21 @@ class SkillManagerTool(BaseTool):
                     status="error",
                     error=f"Cannot update missing skill '{clean_name}'. Use 'create' instead.",
                 )
-            desc = (description or (existing.description if existing else "")).strip()
+            desc = " ".join((description or (existing.description if existing else "")).splitlines()).strip()
             instr = (instructions or (existing.instructions if existing else "")).strip()
+            target_status = existing.status if existing else "active"
             if not desc or not instr:
                 return ToolResult(
                     tool_name=self.name,
                     status="error",
                     error="Both 'description' and 'instructions' are required.",
+                )
+            scan = scan_skill_content(clean_name, desc, instr, status=target_status)
+            if not scan.safe:
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=format_scan_rejection(scan),
                 )
             try:
                 path = self.skill_engine.save_skill(
@@ -99,7 +108,7 @@ class SkillManagerTool(BaseTool):
                         name=clean_name,
                         description=desc,
                         instructions=instr,
-                        status=existing.status if existing else "active",
+                        status=target_status,
                     )
                 )
             except Exception as exc:

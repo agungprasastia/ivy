@@ -10,8 +10,8 @@ from typing import Any, Awaitable, Callable
 
 from ivy.config import IvyConfig
 from ivy.core.llm import LLMClient
-from ivy.core.prompt import build_system_prompt, format_tool_result
-from ivy.core.types import ChatMessage, Role
+from ivy.core.prompt import build_system_prompt, format_tool_result, redact_secrets
+from ivy.core.types import ChatMessage, Role, ToolCall
 from ivy.memory.context import ContextWindowManager, should_auto_compact
 from ivy.memory.store import MemoryStore
 from ivy.skills.engine import SkillEngine
@@ -158,6 +158,33 @@ class IvyAgent:
         if inspect.isawaitable(res):
             await res
 
+    @staticmethod
+    def _sanitize_reply_for_history(reply: ChatMessage) -> ChatMessage:
+        """Scrub secrets from memory_note(add) tool-call args before storage/replay."""
+        if not reply.tool_calls:
+            return reply
+        clean_calls: list[ToolCall] = []
+        changed = False
+        for tc in reply.tool_calls:
+            if (
+                tc.function_name == "memory_note"
+                and isinstance(tc.arguments, dict)
+                and str(tc.arguments.get("action", "")).strip().lower() == "add"
+            ):
+                new_args = dict(tc.arguments)
+                for key in ("note", "category"):
+                    if isinstance(new_args.get(key), str):
+                        new_args[key] = redact_secrets(new_args[key])
+                clean_calls.append(
+                    ToolCall(id=tc.id, function_name=tc.function_name, arguments=new_args)
+                )
+                changed = True
+            else:
+                clean_calls.append(tc)
+        if not changed:
+            return reply
+        return reply.model_copy(update={"tool_calls": clean_calls})
+
     async def run_turn(
         self,
         prompt: str,
@@ -169,8 +196,10 @@ class IvyAgent:
     ) -> ChatMessage:
         """Execute one full user turn through the ReAct loop."""
         user_profile: dict[str, str] | None = None
+        memory_notes: list[dict[str, Any]] | None = None
         if self.memory_store is not None:
             user_profile = await self.memory_store.get_user_profile()
+            memory_notes = await self.memory_store.list_memory_notes(limit=50)
 
         raw_model = getattr(self.llm_client, "model", None)
         model_name = raw_model if isinstance(raw_model, str) else None
@@ -178,6 +207,7 @@ class IvyAgent:
         system_prompt = build_system_prompt(
             skill_engine=self.skill_engine,
             user_profile=user_profile,
+            memory_notes=memory_notes,
             extra_instructions=self.extra_system_instructions,
             model=model_name,
             platform=platform,
@@ -217,11 +247,12 @@ class IvyAgent:
             )
             self._accumulate_usage(turn_usage, reply)
 
+            history_reply = self._sanitize_reply_for_history(reply)
             if not user_persisted:
                 await self._persist_message(session_id, user_msg, platform=platform)
                 user_persisted = True
-            await self._persist_message(session_id, reply, platform=platform)
-            messages.append(reply)
+            await self._persist_message(session_id, history_reply, platform=platform)
+            messages.append(history_reply)
 
             if not reply.tool_calls:
                 if used_tools and self.skill_generator is not None and not self.exclude_from_fts:

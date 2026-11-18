@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from ivy.core.subagent import SubagentRunner
 
 MAX_BATCH_TASKS = 4
-_BLOCKED_CHILD_TOOLS = {"delegate_task", "clarify"}
+_BLOCKED_CHILD_TOOLS = {"delegate_task", "clarify", "process"}
 
 
 class DelegateTaskTool(BaseTool):

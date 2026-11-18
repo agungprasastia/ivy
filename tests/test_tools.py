@@ -474,3 +474,72 @@ async def test_phase3_tools_checkpoint_session_search_skill_cron_and_mcp(tmp_pat
     finally:
         await mcp_mgr.close_all()
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_background_process_manager_and_process_tool(tmp_path):
+    import sys
+    from ivy.tools.process_registry import BackgroundProcessManager, ProcessManageTool
+
+    mgr = BackgroundProcessManager(max_output_chars=12_000)
+    proc_tool = ProcessManageTool(manager=mgr)
+    term = TerminalTool(
+        approval_policy=SafetyApprovalPolicy(auto_approve=True),
+        process_manager=mgr,
+    )
+
+    # 1. Safety guard still blocks destructive background commands
+    denied = await TerminalTool(
+        approval_policy=SafetyApprovalPolicy(auto_approve=False, interactive=False),
+        process_manager=mgr,
+    ).execute(command="rm -rf /", background=True)
+    assert denied.status == "rejected"
+
+    # 2. Spawn interactive echo script cleanly across Windows & POSIX
+    script = tmp_path / "bg_echo.py"
+    script.write_text(
+        "import sys\n"
+        "print('OPENAI_API_KEY=sk-proj-secret1234567890abcdef12', flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    print('GOT:' + line.strip(), flush=True)\n",
+        encoding="utf-8",
+    )
+    # Use PowerShell/Bash-safe quoting (`& "py" "script"` on Windows or direct python invocation via -c? Note `"py" "script"` is rejected by PowerShell syntax unless `&` precedes quoted executable, OR use sys.executable unquoted / `&`? Wait: let's check!)
+    cmd = f'"{sys.executable}" "{script}"' if sys.platform != "win32" else f'& "{sys.executable}" "{script}"'
+    spawned = await term.execute(command=cmd, working_dir=str(tmp_path), background=True)
+    assert spawned.status == "success", spawned.error
+    pid_tag = spawned.metadata["process_id"]
+
+    await asyncio.sleep(0.1)
+    deadline = asyncio.get_running_loop().time() + 5.0
+    polled = await proc_tool.execute(action="poll", process_id=pid_tag)
+    while "OPENAI_API_KEY=" not in polled.output and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.1)
+        polled = await proc_tool.execute(action="poll", process_id=pid_tag)
+    assert polled.status == "success"
+    assert "OPENAI_API_KEY=" in polled.output
+    assert "sk-proj-secret1234567890abcdef12" not in polled.output
+
+    wrote = await proc_tool.execute(action="write", process_id=pid_tag, data="hello-bg\n")
+    assert wrote.status == "success"
+
+    deadline2 = asyncio.get_running_loop().time() + 5.0
+    polled2 = await proc_tool.execute(action="log", process_id=pid_tag)
+    while "GOT:hello-bg" not in polled2.output and asyncio.get_running_loop().time() < deadline2:
+        await asyncio.sleep(0.1)
+        polled2 = await proc_tool.execute(action="log", process_id=pid_tag)
+    assert "GOT:hello-bg" in polled2.output
+
+    listed = await proc_tool.execute(action="list")
+    assert pid_tag in listed.output
+
+    killed = await proc_tool.execute(action="kill", process_id=pid_tag)
+    assert killed.status == "success"
+
+    missing = await proc_tool.execute(action="poll", process_id="proc_missing")
+    assert missing.status == "error"
+
+    write_closed = await proc_tool.execute(action="write", process_id=pid_tag, data="late\n")
+    assert write_closed.status == "error"
+
+    await mgr.shutdown_all()

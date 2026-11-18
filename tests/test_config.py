@@ -1,4 +1,3 @@
-import os
 from ivy.config import IvyConfig, load_config
 
 

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ivy Architecture & Agent Guide
+    url: https://github.com/agungprasastia/ivy/blob/master/AGENTS.md
+    about: Read repository conventions, test commands, and architecture layers before contributing.

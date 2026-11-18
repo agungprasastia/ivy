@@ -1,0 +1,57 @@
+name: Bug Report
+description: Report a crash, incorrect tool behavior, TUI rendering glitch, or test failure in Ivy.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue in **Ivy**. Please avoid pasting live API keys or tokens.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact CLI command, slash command, or prompt that triggers the issue.
+      placeholder: |
+        1. Run `uv run ivy`
+        2. Execute `/...` or send prompt `...`
+        3. Observe error
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System / Shell
+      options:
+        - Windows (PowerShell)
+        - Linux (Bash/Zsh)
+        - macOS (Zsh/Bash)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python_version
+    attributes:
+      label: Python Version
+      placeholder: "e.g. 3.11.9 / 3.12.7"
+    validations:
+      required: true
+  - type: input
+    id: model_provider
+    attributes:
+      label: Model / Provider
+      description: Optional — include if related to LLM streaming or tool calling.
+      placeholder: "e.g. openai/gpt-4o-mini, anthropic/claude-sonnet-4-5, ollama/qwen2.5"
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: "`ivy doctor --no-live` output or traceback"
+      description: Paste relevant logs or redacted traceback (never include raw secrets).
+      render: shell

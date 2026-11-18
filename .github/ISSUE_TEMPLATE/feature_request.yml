@@ -1,0 +1,38 @@
+name: Feature Request
+description: Propose a new tool, TUI improvement, skill capability, or gateway integration for Ivy.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: What workflow is missing, slow, or inconvenient today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the UX, CLI/slash command, tool behavior, or config options you envision.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core Agent Loop / LLM
+        - Tools / MCP / Sandbox
+        - TUI / Slash Commands
+        - Memory / Skills / Cron
+        - Gateway (Telegram / Discord)
+        - Docs / DX / Testing
+    validations:
+      required: true
+  - type: checkboxes
+    id: dependencies
+    attributes:
+      label: Dependency Impact
+      options:
+        - label: Can be implemented with standard library + existing 7 runtime dependencies

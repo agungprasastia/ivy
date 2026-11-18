@@ -41,6 +41,33 @@ class IvyConfig(BaseModel):
     max_iterations: int = 50
     subagent_max_iterations: int = 8
     code_runner_timeout: float = 30.0
+    llm_max_retries: int = 2
+    llm_retry_base_delay: float = 0.5
+    fallback_model: str | None = None
+    auto_compact_threshold: float = 0.85
+
+    @field_validator("llm_max_retries", mode="before")
+    @classmethod
+    def clamp_retries(cls, v: Any) -> int:
+        return max(0, int(v))
+
+    @field_validator("llm_retry_base_delay", mode="before")
+    @classmethod
+    def clamp_retry_delay(cls, v: Any) -> float:
+        return max(0.0, float(v))
+
+    @field_validator("fallback_model", mode="before")
+    @classmethod
+    def normalize_fallback_model(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @field_validator("auto_compact_threshold", mode="before")
+    @classmethod
+    def clamp_compact_threshold(cls, v: Any) -> float:
+        return min(0.99, max(0.1, float(v)))
 
     @field_validator("allowed_users", mode="before")
     @classmethod
@@ -92,6 +119,10 @@ def load_config(env_file: str | Path | None = None) -> IvyConfig:
         "log_level": ["LOG_LEVEL"],
         "default_theme": ["IVY_THEME"],
         "max_iterations": ["MAX_ITERATIONS", "IVY_MAX_ITERATIONS"],
+        "llm_max_retries": ["IVY_LLM_MAX_RETRIES"],
+        "llm_retry_base_delay": ["IVY_LLM_RETRY_BASE_DELAY"],
+        "fallback_model": ["IVY_FALLBACK_MODEL"],
+        "auto_compact_threshold": ["IVY_AUTO_COMPACT_THRESHOLD"],
     }
 
     for field, env_vars in env_map.items():

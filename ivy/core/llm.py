@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import logging
 import os
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -12,6 +14,33 @@ from openai import AsyncOpenAI
 
 from ivy.config import IvyConfig, load_config
 from ivy.core.types import ChatMessage, Role, ToolCall
+
+logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
+_RETRYABLE_CLASS_NAMES = {
+    "RateLimitError",
+    "APITimeoutError",
+    "APIConnectionError",
+    "InternalServerError",
+    "ServiceUnavailableError",
+}
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """True when an LLM SDK exception represents a transient rate-limit, timeout, or 5xx error."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        if status in _NON_RETRYABLE_STATUS_CODES:
+            return False
+        if status in _RETRYABLE_STATUS_CODES:
+            return True
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
+        return True
+    return type(exc).__name__ in _RETRYABLE_CLASS_NAMES
 
 def _extract_usage_dict(usage_obj: Any) -> dict[str, int] | None:
     """Normalize OpenAI/Anthropic usage objects or dicts into {prompt_tokens, completion_tokens, total_tokens}."""
@@ -245,6 +274,55 @@ class LLMClient:
         system_prompt = "\n\n".join(system_parts) if system_parts else None
         return system_prompt, formatted, anthropic_tools
 
+    async def _execute_with_resilience(
+        self,
+        operation: Callable[[], Awaitable[ChatMessage]],
+        *,
+        can_retry: Callable[[], bool] | None = None,
+    ) -> ChatMessage:
+        """Run an async LLM operation with exponential backoff retries and optional fallback model."""
+        max_retries = max(0, int(getattr(self.config, "llm_max_retries", 2)))
+        base_delay = max(0.0, float(getattr(self.config, "llm_retry_base_delay", 0.5)))
+        primary_model = self.model
+
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_exc = exc
+                allowed = can_retry() if can_retry is not None else True
+                if not allowed or not _is_retryable_error(exc):
+                    raise
+                if attempt < max_retries:
+                    delay = base_delay * (2**attempt)
+                    logger.warning(
+                        "Transient LLM error on %s (attempt %d/%d): %s; retrying in %.2fs",
+                        self.model,
+                        attempt + 1,
+                        max_retries + 1,
+                        exc,
+                        delay,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+        fallback = (getattr(self.config, "fallback_model", None) or "").strip()
+        if fallback and fallback != primary_model and (can_retry is None or can_retry()):
+            logger.warning("Primary model %s exhausted retries; falling back to %s", primary_model, fallback)
+            try:
+                self.set_model(fallback)
+                reply = await operation()
+            finally:
+                self.set_model(primary_model)
+            reply.metadata = dict(reply.metadata or {})
+            reply.metadata["fallback_used"] = True
+            reply.metadata["model_used"] = fallback
+            return reply
+
+        assert last_exc is not None
+        raise last_exc
+
     async def chat_completion(
         self,
         messages: list[ChatMessage | dict[str, Any]],
@@ -254,34 +332,59 @@ class LLMClient:
         **kwargs: Any,
     ) -> ChatMessage | AsyncIterator[str]:
         """Execute a chat completion request across OpenAI-compatible or Anthropic providers."""
-        if self.provider == "anthropic":
-            return await self._anthropic_completion(
-                messages=messages,
-                tools=tools,
-                stream=stream,
-                temperature=temperature,
-                **kwargs,
-            )
-
-        formatted_messages = self._format_openai_messages(messages)
-        params: dict[str, Any] = {
-            "model": self.resolved_model,
-            "messages": formatted_messages,
-            "stream": stream,
-            **kwargs,
-        }
-        if temperature is not None:
-            params["temperature"] = temperature
-        if tools:
-            params["tools"] = tools
-            params["tool_choice"] = kwargs.get("tool_choice", "auto")
-
-        client = self._get_openai_client()
         if stream:
-            return self._stream_openai(client, params)
+            if self.provider == "anthropic":
+                return await self._anthropic_completion(
+                    messages=messages,
+                    tools=tools,
+                    stream=True,
+                    temperature=temperature,
+                    **kwargs,
+                )
+            formatted_messages = self._format_openai_messages(messages)
+            params: dict[str, Any] = {
+                "model": self.resolved_model,
+                "messages": formatted_messages,
+                "stream": True,
+                **kwargs,
+            }
+            if temperature is not None:
+                params["temperature"] = temperature
+            if tools:
+                params["tools"] = tools
+                params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            return self._stream_openai(self._get_openai_client(), params)
 
-        response = await client.chat.completions.create(**params)
-        return self._parse_openai_response(response)
+        async def _once() -> ChatMessage:
+            if self.provider == "anthropic":
+                res = await self._anthropic_completion(
+                    messages=messages,
+                    tools=tools,
+                    stream=False,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                assert isinstance(res, ChatMessage)
+                return res
+
+            formatted_messages = self._format_openai_messages(messages)
+            params: dict[str, Any] = {
+                "model": self.resolved_model,
+                "messages": formatted_messages,
+                "stream": False,
+                **kwargs,
+            }
+            if temperature is not None:
+                params["temperature"] = temperature
+            if tools:
+                params["tools"] = tools
+                params["tool_choice"] = kwargs.get("tool_choice", "auto")
+
+            client = self._get_openai_client()
+            response = await client.chat.completions.create(**params)
+            return self._parse_openai_response(response)
+
+        return await self._execute_with_resilience(_once)
 
     async def stream_turn(
         self,
@@ -292,85 +395,170 @@ class LLMClient:
         **kwargs: Any,
     ) -> ChatMessage:
         """Stream response tokens via on_token while assembling text and tool calls."""
+        emitted_any = False
+
         async def _emit(chunk_text: str) -> None:
-            if on_token is None or not chunk_text:
+            nonlocal emitted_any
+            if not chunk_text:
+                return
+            emitted_any = True
+            if on_token is None:
                 return
             res = on_token(chunk_text)
             if inspect.isawaitable(res):
                 await res
 
-        if self.provider == "anthropic":
-            system_prompt, formatted, anthropic_tools = self._format_anthropic_payload(
-                messages, tools
-            )
-            params: dict[str, Any] = {
+        async def _stream_once() -> ChatMessage:
+            call_kwargs = dict(kwargs)
+            if self.provider == "anthropic":
+                system_prompt, formatted, anthropic_tools = self._format_anthropic_payload(
+                    messages, tools
+                )
+                params: dict[str, Any] = {
+                    "model": self.resolved_model,
+                    "messages": formatted,
+                    "max_tokens": call_kwargs.pop("max_tokens", 4096),
+                    "stream": True,
+                    **call_kwargs,
+                }
+                if system_prompt:
+                    params["system"] = system_prompt
+                if temperature is not None:
+                    params["temperature"] = temperature
+                if anthropic_tools:
+                    params["tools"] = anthropic_tools
+
+                client = self._get_anthropic_client()
+                resp = await client.messages.create(**params)
+                text_parts: list[str] = []
+                tool_blocks: dict[int, dict[str, Any]] = {}
+                usage_stats: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                async for event in resp:
+                    etype = getattr(event, "type", None)
+                    if etype == "message_start":
+                        msg_obj = getattr(event, "message", None)
+                        u = _extract_usage_dict(getattr(msg_obj, "usage", None))
+                        if u:
+                            usage_stats["prompt_tokens"] += u["prompt_tokens"]
+                    elif etype == "message_delta":
+                        u = _extract_usage_dict(getattr(event, "usage", None))
+                        if u:
+                            usage_stats["completion_tokens"] += u["completion_tokens"]
+                    elif etype == "content_block_start":
+                        idx = getattr(event, "index", 0)
+                        blk = getattr(event, "content_block", None)
+                        if getattr(blk, "type", None) == "tool_use":
+                            tool_blocks[idx] = {
+                                "id": getattr(blk, "id", ""),
+                                "name": getattr(blk, "name", ""),
+                                "raw_args": "",
+                            }
+                    elif etype == "content_block_delta":
+                        idx = getattr(event, "index", 0)
+                        delta = getattr(event, "delta", None)
+                        dtype = getattr(delta, "type", None)
+                        if dtype == "text_delta" or getattr(delta, "text", None):
+                            t = getattr(delta, "text", "") or ""
+                            if t:
+                                text_parts.append(t)
+                                await _emit(t)
+                        elif dtype == "input_json_delta" and idx in tool_blocks:
+                            tool_blocks[idx]["raw_args"] += getattr(delta, "partial_json", "") or ""
+
+                parsed_calls: list[ToolCall] = []
+                for idx in sorted(tool_blocks):
+                    tb = tool_blocks[idx]
+                    raw_json = tb["raw_args"].strip()
+                    try:
+                        args_dict = json.loads(raw_json) if raw_json else {}
+                    except Exception:
+                        args_dict = {"raw_input": raw_json}
+                    parsed_calls.append(
+                        ToolCall(
+                            id=str(tb["id"]),
+                            function_name=str(tb["name"]),
+                            arguments=args_dict if isinstance(args_dict, dict) else {},
+                        )
+                    )
+                usage_stats["total_tokens"] = usage_stats["prompt_tokens"] + usage_stats["completion_tokens"]
+                meta = {"usage": usage_stats} if usage_stats["total_tokens"] > 0 else {}
+                return ChatMessage(
+                    role=Role.ASSISTANT,
+                    content="".join(text_parts),
+                    tool_calls=parsed_calls or None,
+                    metadata=meta,
+                )
+
+            formatted_messages = self._format_openai_messages(messages)
+            params = {
                 "model": self.resolved_model,
-                "messages": formatted,
-                "max_tokens": kwargs.pop("max_tokens", 4096),
+                "messages": formatted_messages,
                 "stream": True,
-                **kwargs,
+                "stream_options": {"include_usage": True},
+                **call_kwargs,
             }
-            if system_prompt:
-                params["system"] = system_prompt
             if temperature is not None:
                 params["temperature"] = temperature
-            if anthropic_tools:
-                params["tools"] = anthropic_tools
+            if tools:
+                params["tools"] = tools
+                params["tool_choice"] = call_kwargs.get("tool_choice", "auto")
 
-            client = self._get_anthropic_client()
-            resp = await client.messages.create(**params)
-            text_parts: list[str] = []
-            tool_blocks: dict[int, dict[str, Any]] = {}
-            usage_stats: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            async for event in resp:
-                etype = getattr(event, "type", None)
-                if etype == "message_start":
-                    msg_obj = getattr(event, "message", None)
-                    u = _extract_usage_dict(getattr(msg_obj, "usage", None))
-                    if u:
-                        usage_stats["prompt_tokens"] += u["prompt_tokens"]
-                elif etype == "message_delta":
-                    u = _extract_usage_dict(getattr(event, "usage", None))
-                    if u:
-                        usage_stats["completion_tokens"] += u["completion_tokens"]
-                elif etype == "content_block_start":
-                    idx = getattr(event, "index", 0)
-                    blk = getattr(event, "content_block", None)
-                    if getattr(blk, "type", None) == "tool_use":
-                        tool_blocks[idx] = {
-                            "id": getattr(blk, "id", ""),
-                            "name": getattr(blk, "name", ""),
-                            "raw_args": "",
-                        }
-                elif etype == "content_block_delta":
-                    idx = getattr(event, "index", 0)
-                    delta = getattr(event, "delta", None)
-                    dtype = getattr(delta, "type", None)
-                    if dtype == "text_delta" or getattr(delta, "text", None):
-                        t = getattr(delta, "text", "") or ""
-                        if t:
-                            text_parts.append(t)
-                            await _emit(t)
-                    elif dtype == "input_json_delta" and idx in tool_blocks:
-                        tool_blocks[idx]["raw_args"] += getattr(delta, "partial_json", "") or ""
+            client = self._get_openai_client()
+            try:
+                resp = await client.chat.completions.create(**params)
+            except Exception as exc:
+                # Some OpenAI-compatible proxies reject stream_options; fall back cleanly.
+                if "stream_options" in params and ("stream_options" in str(exc).lower() or isinstance(exc, TypeError)):
+                    params.pop("stream_options", None)
+                    resp = await client.chat.completions.create(**params)
+                else:
+                    raise
+            text_parts = []
+            tc_acc: dict[int, dict[str, str]] = {}
+            stream_usage: dict[str, int] | None = None
 
-            parsed_calls: list[ToolCall] = []
-            for idx in sorted(tool_blocks):
-                tb = tool_blocks[idx]
-                raw_json = tb["raw_args"].strip()
+            async for chunk in resp:
+                chunk_usage = _extract_usage_dict(getattr(chunk, "usage", None))
+                if chunk_usage:
+                    stream_usage = chunk_usage
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                content_piece = getattr(delta, "content", None)
+                if content_piece:
+                    text_parts.append(content_piece)
+                    await _emit(content_piece)
+                raw_tcs = getattr(delta, "tool_calls", None)
+                for tc in raw_tcs or []:
+                    idx = getattr(tc, "index", 0)
+                    entry = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if getattr(tc, "id", None):
+                        entry["id"] = str(tc.id)
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            entry["name"] += str(fn.name)
+                        if getattr(fn, "arguments", None):
+                            entry["arguments"] += str(fn.arguments)
+
+            parsed_calls = []
+            for idx in sorted(tc_acc):
+                item = tc_acc[idx]
                 try:
-                    args_dict = json.loads(raw_json) if raw_json else {}
+                    args_dict = json.loads(item["arguments"]) if item["arguments"].strip() else {}
                 except Exception:
-                    args_dict = {"raw_input": raw_json}
+                    args_dict = {"raw_input": item["arguments"]}
                 parsed_calls.append(
                     ToolCall(
-                        id=str(tb["id"]),
-                        function_name=str(tb["name"]),
+                        id=item["id"] or f"call_{idx}",
+                        function_name=item["name"],
                         arguments=args_dict if isinstance(args_dict, dict) else {},
                     )
                 )
-            usage_stats["total_tokens"] = usage_stats["prompt_tokens"] + usage_stats["completion_tokens"]
-            meta = {"usage": usage_stats} if usage_stats["total_tokens"] > 0 else {}
+            meta = {"usage": stream_usage} if stream_usage else {}
             return ChatMessage(
                 role=Role.ASSISTANT,
                 content="".join(text_parts),
@@ -378,82 +566,7 @@ class LLMClient:
                 metadata=meta,
             )
 
-        formatted_messages = self._format_openai_messages(messages)
-        params = {
-            "model": self.resolved_model,
-            "messages": formatted_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            **kwargs,
-        }
-        if temperature is not None:
-            params["temperature"] = temperature
-        if tools:
-            params["tools"] = tools
-            params["tool_choice"] = kwargs.get("tool_choice", "auto")
-
-        client = self._get_openai_client()
-        try:
-            resp = await client.chat.completions.create(**params)
-        except Exception as exc:
-            # Some OpenAI-compatible proxies reject stream_options; fall back cleanly.
-            if "stream_options" in params and ("stream_options" in str(exc).lower() or isinstance(exc, TypeError)):
-                params.pop("stream_options", None)
-                resp = await client.chat.completions.create(**params)
-            else:
-                raise
-        text_parts = []
-        tc_acc: dict[int, dict[str, str]] = {}
-        stream_usage: dict[str, int] | None = None
-
-        async for chunk in resp:
-            chunk_usage = _extract_usage_dict(getattr(chunk, "usage", None))
-            if chunk_usage:
-                stream_usage = chunk_usage
-            choices = getattr(chunk, "choices", None)
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            if delta is None:
-                continue
-            content_piece = getattr(delta, "content", None)
-            if content_piece:
-                text_parts.append(content_piece)
-                await _emit(content_piece)
-            raw_tcs = getattr(delta, "tool_calls", None)
-            for tc in raw_tcs or []:
-                idx = getattr(tc, "index", 0)
-                entry = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if getattr(tc, "id", None):
-                    entry["id"] = str(tc.id)
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        entry["name"] += str(fn.name)
-                    if getattr(fn, "arguments", None):
-                        entry["arguments"] += str(fn.arguments)
-
-        parsed_calls = []
-        for idx in sorted(tc_acc):
-            item = tc_acc[idx]
-            try:
-                args_dict = json.loads(item["arguments"]) if item["arguments"].strip() else {}
-            except Exception:
-                args_dict = {"raw_input": item["arguments"]}
-            parsed_calls.append(
-                ToolCall(
-                    id=item["id"] or f"call_{idx}",
-                    function_name=item["name"],
-                    arguments=args_dict if isinstance(args_dict, dict) else {},
-                )
-            )
-        meta = {"usage": stream_usage} if stream_usage else {}
-        return ChatMessage(
-            role=Role.ASSISTANT,
-            content="".join(text_parts),
-            tool_calls=parsed_calls or None,
-            metadata=meta,
-        )
+        return await self._execute_with_resilience(_stream_once, can_retry=lambda: not emitted_any)
 
     async def _stream_openai(
         self, client: AsyncOpenAI, params: dict[str, Any]

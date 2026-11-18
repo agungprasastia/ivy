@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from ivy.config import IvyConfig
@@ -324,3 +324,106 @@ async def test_llm_client_captures_usage_and_handles_stream_options_fallback():
         "completion_tokens": 5,
         "total_tokens": 20,
     }
+
+
+@pytest.mark.asyncio
+async def test_llm_client_retries_transient_error_then_succeeds(monkeypatch):
+    class RateLimitErr(Exception):
+        status_code = 429
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        default_model="gpt-4o-mini",
+        llm_max_retries=2,
+        llm_retry_base_delay=0.1,
+    )
+    client = LLMClient(config=cfg)
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(
+        side_effect=[
+            RateLimitErr("rate limit"),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Recovered", tool_calls=None))],
+                usage=None,
+            ),
+        ]
+    )
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+
+    reply = await client.chat_completion([ChatMessage(role=Role.USER, content="hi")])
+    assert reply.content == "Recovered"
+    assert mock_openai.chat.completions.create.await_count == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_falls_back_after_retry_exhaustion_and_restores_model(monkeypatch):
+    class ServerErr(Exception):
+        status_code = 503
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        anthropic_api_key="test-ant",
+        default_model="gpt-4o-mini",
+        fallback_model="anthropic/claude-sonnet-4-5",
+        llm_max_retries=1,
+        llm_retry_base_delay=0.05,
+    )
+    client = LLMClient(config=cfg)
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(side_effect=ServerErr("down"))
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+    monkeypatch.setattr(
+        client,
+        "_anthropic_completion",
+        AsyncMock(return_value=ChatMessage(role=Role.ASSISTANT, content="From fallback")),
+    )
+
+    reply = await client.chat_completion([ChatMessage(role=Role.USER, content="hi")])
+    assert reply.content == "From fallback"
+    assert reply.metadata.get("fallback_used") is True
+    assert client.model == "gpt-4o-mini"
+    assert client.provider == "openai"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_does_not_retry_auth_error_or_mid_stream_failure(monkeypatch):
+    class AuthErr(Exception):
+        status_code = 401
+
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("asyncio.sleep", sleep_mock)
+    cfg = IvyConfig(
+        openai_api_key="bad-key",
+        anthropic_api_key="ant-key",
+        default_model="gpt-4o-mini",
+        fallback_model="anthropic/claude-sonnet-4-5",
+        llm_max_retries=2,
+    )
+    client = LLMClient(config=cfg)
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(side_effect=AuthErr("401 unauthorized"))
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+
+    with pytest.raises(AuthErr):
+        await client.chat_completion([ChatMessage(role=Role.USER, content="hi")])
+    assert mock_openai.chat.completions.create.await_count == 1
+    assert sleep_mock.await_count == 0
+
+    class MidStreamErr(Exception):
+        status_code = 502
+
+    async def partial_stream(*args, **kwargs):
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="half ", tool_calls=None))], usage=None)
+        raise MidStreamErr("dropped mid stream")
+
+    mock_openai.chat.completions.create = AsyncMock(return_value=partial_stream())
+    seen = []
+    with pytest.raises(MidStreamErr):
+        await client.stream_turn([ChatMessage(role=Role.USER, content="hi")], on_token=seen.append)
+    assert seen == ["half "]
+    assert mock_openai.chat.completions.create.await_count == 1
+    await client.close()

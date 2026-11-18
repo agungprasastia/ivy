@@ -66,7 +66,6 @@ from ivy.tui.views import (
     render_help_table,
     render_history_view,
     render_memory_results,
-    render_session_recap,
     render_sessions_table,
     render_skills_table,
     render_status_panel,
@@ -547,11 +546,6 @@ class IvyCLIApp:
             f"Switched session to: [{self.theme.ui_label}]{self.session_id}[/]"
             + (f" [dim]({self._session_title})[/dim]" if self._session_title else "")
         )
-        history = await self.memory_store.get_messages(self.session_id, limit=50)
-        if history:
-            render_session_recap(
-                self.console, self.session_id, self._session_title, history, theme=self.theme
-            )
 
     async def handle_slash_command(self, raw_line: str) -> bool:
         """Handle a slash command (exact, alias, unique prefix, typo hint). Returns False to exit."""
@@ -1079,11 +1073,6 @@ class IvyCLIApp:
             session_title=self._session_title,
             git_branch=self._git_branch,
         )
-        existing = await self.memory_store.get_messages(self.session_id, limit=50)
-        if existing:
-            render_session_recap(
-                self.console, self.session_id, self._session_title, existing, theme=self.theme
-            )
         prompt_session = create_prompt_session(
             theme=self.theme,
             bottom_toolbar=self._render_toolbar,

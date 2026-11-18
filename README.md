@@ -1,6 +1,16 @@
-# Ivy
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ivy-mascot-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/ivy-mascot.png">
+    <img src=".github/assets/ivy-mascot.png" width="380" alt="Ivy — Autonomous AI Agent">
+  </picture>
+</p>
 
-Autonomous, self-improving Python agent inspired by **Hermes Agent**. Built cleanly for Python 3.11+ (verified on Python 3.15.2) and managed with Astral `uv`.
+<h1 align="center">Ivy</h1>
+
+<p align="center">
+  Autonomous, self-improving Python agent. Built cleanly for Python 3.11+ and managed with Astral <code>uv</code>.
+</p>
 
 ---
 

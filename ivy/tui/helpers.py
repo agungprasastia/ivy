@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -247,6 +248,32 @@ def format_token_count(count: int) -> str:
     if count >= 1_000:
         return f"{count / 1_000:.1f}k"
     return str(count)
+
+
+def format_relative_time(iso_ts: str | None) -> str:
+    """Convert ISO-8601 UTC timestamp to friendly relative label (e.g. '5m ago')."""
+    if not iso_ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta_s = int((datetime.now(timezone.utc) - dt).total_seconds())
+    except ValueError:
+        return str(iso_ts)[:16].replace("T", " ")
+
+    if delta_s < 45:
+        return "just now"
+    if delta_s < 3600:
+        return f"{delta_s // 60}m ago"
+    if delta_s < 86_400:
+        return f"{delta_s // 3600}h ago"
+    days = delta_s // 86_400
+    if days == 1:
+        return "yesterday"
+    if days < 7:
+        return f"{days}d ago"
+    return dt.astimezone().strftime("%b %d")
 
 
 def export_session_markdown(

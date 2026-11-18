@@ -15,7 +15,7 @@ from rich.table import Table
 
 from ivy import __version__
 from ivy.core.types import ChatMessage, Role
-from ivy.tui.helpers import format_token_count, get_git_branch
+from ivy.tui.helpers import format_relative_time, format_token_count, get_git_branch
 from ivy.tui.theme import IVY_ASCII_LOGO, IVY_HERO_ART, ThemeConfig, get_theme
 
 _TOOL_GROUPS: dict[str, str] = {
@@ -374,14 +374,14 @@ def render_sessions_table(
     table.add_column("Last Updated", style="dim")
     for idx, s in enumerate(sessions, start=1):
         sid = s.get("session_id", "")
-        marker = f"[{t.ui_ok}]*[/]" if sid == current_session_id else ""
-        updated = str(s.get("updated_at") or "")[:19].replace("T", " ")
-        title = str(s.get("title") or "")[:36]
+        marker = f"[{t.ui_ok}]●[/]" if sid == current_session_id else ""
+        updated = format_relative_time(s.get("updated_at")) or str(s.get("updated_at") or "")[:16]
+        title = str(s.get("title") or "").strip()[:38]
         table.add_row(
             str(idx),
             marker,
             sid,
-            escape(title) if title else "[dim]—[/dim]",
+            escape(title) if title else "[dim](new session)[/dim]",
             str(s.get("message_count", 0)),
             updated,
         )

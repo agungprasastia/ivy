@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -134,10 +134,12 @@ class SlashCompleter(Completer):
         self,
         skill_engine: SkillEngine | None = None,
         cwd: str | None = None,
+        session_provider: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.words = list(SLASH_COMMANDS)
         self.skill_engine = skill_engine
         self.cwd = cwd
+        self.session_provider = session_provider
         self._file_cache: list[str] = []
         self._file_cache_ts: float = 0.0
 
@@ -219,6 +221,21 @@ class SlashCompleter(Completer):
                     )
             return
 
+        # Level 2: `/session <id>` or `list`
+        if cmd in ("/session", "/resume") and arg_pos == 1:
+            if "list".startswith(partial.lower()):
+                yield Completion("list", start_position=-len(partial), display_meta="List saved sessions")
+            if self.session_provider is not None:
+                for sess in self.session_provider():
+                    sid = str(sess.get("session_id") or "")
+                    if not sid or not sid.lower().startswith(partial.lower()):
+                        continue
+                    title = (sess.get("title") or "").strip()
+                    msgs = sess.get("message_count", 0)
+                    meta = f"{title} ({msgs} msgs)" if title else f"{msgs} msgs"
+                    yield Completion(sid, start_position=-len(partial), display_meta=meta)
+            return
+
         # Level 2: static subcommands
         if cmd in _SUBCOMMAND_META and arg_pos == 1:
             for sub, meta in _SUBCOMMAND_META[cmd].items():
@@ -251,9 +268,10 @@ class SlashCompleter(Completer):
 def build_slash_completer(
     skill_engine: SkillEngine | None = None,
     cwd: str | None = None,
+    session_provider: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> SlashCompleter:
     """Create nested autocomplete completer for slash commands and @mentions."""
-    return SlashCompleter(skill_engine=skill_engine, cwd=cwd)
+    return SlashCompleter(skill_engine=skill_engine, cwd=cwd, session_provider=session_provider)
 
 
 def build_prompt_style(theme: ThemeConfig | None = None) -> Style:
@@ -352,7 +370,7 @@ def build_bottom_toolbar(
         pct = max(0.0, min(100.0, float(ctx_percent)))
         cells = 8
         filled = max(0, min(cells, round((pct / 100.0) * cells)))
-        bar = f"{'█' * filled}{'░' * (cells - filled)}"
+        bar = f"{'■' * filled}{'·' * (cells - filled)}"
         prefix = "~" if ctx_estimated else ""
         left_parts.extend([
             ("class:bottom-toolbar.dim", " · "),
@@ -421,12 +439,15 @@ def create_prompt_session(
     skill_engine: SkillEngine | None = None,
     history_path: str | Path | None = None,
     cwd: str | None = None,
+    session_provider: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> PromptSession[str]:
     """Create interactive prompt_toolkit session with FileHistory, bindings & completion."""
     return PromptSession(
         history=_resolve_history(history_path),
         auto_suggest=AutoSuggestFromHistory(),
-        completer=build_slash_completer(skill_engine=skill_engine, cwd=cwd),
+        completer=build_slash_completer(
+            skill_engine=skill_engine, cwd=cwd, session_provider=session_provider
+        ),
         complete_while_typing=True,
         key_bindings=build_prompt_key_bindings(),
         style=build_prompt_style(theme),

@@ -8,6 +8,7 @@ import logging
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -41,11 +42,13 @@ from ivy.tui.helpers import (
     expand_at_mentions,
     export_session_json,
     export_session_markdown,
+    format_relative_time,
     format_token_count,
     get_git_branch,
     resolve_slash_command,
     run_git_diff,
 )
+from ivy.tui.picker import PickerOption, run_interactive_picker
 from ivy.tui.prompt import (
     SLASH_COMMANDS,
     build_bottom_toolbar,
@@ -254,6 +257,7 @@ class IvyCLIApp:
     async def _refresh_session_metadata(self) -> None:
         try:
             self._session_title = await self.memory_store.get_session_title(self.session_id)
+            self._cached_sessions = await self.memory_store.list_sessions()
             history = await self.memory_store.get_messages(self.session_id, limit=100)
             breakdown = compute_context_breakdown(
                 history,
@@ -263,6 +267,121 @@ class IvyCLIApp:
             self._ctx_percent = float(breakdown["percent"])
         except Exception:
             pass
+
+    def _can_open_picker(self) -> bool:
+        from io import StringIO
+
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+        if isinstance(getattr(self.console, "file", None), StringIO):
+            return False
+        return True
+
+    async def _run_session_picker(self) -> None:
+        while True:
+            sessions = await self.memory_store.list_sessions()
+            self._cached_sessions = sessions
+            if not sessions:
+                await self.memory_store.ensure_session(self.session_id)
+                sessions = await self.memory_store.list_sessions()
+                self._cached_sessions = sessions
+
+            options: list[PickerOption] = []
+            for s in sessions:
+                sid = str(s.get("session_id") or "")
+                title = (s.get("title") or "").strip() or "(new session)"
+                msgs = int(s.get("message_count", 0))
+                rel = format_relative_time(s.get("updated_at"))
+                options.append(
+                    PickerOption(
+                        value=sid,
+                        label=title,
+                        meta=f"{sid} · {msgs}m · {rel}" if rel else f"{sid} · {msgs}m",
+                    )
+                )
+
+            res = await run_interactive_picker(
+                title=f"Switch Session ({len(options)})",
+                options=options,
+                current_value=self.session_id,
+                theme=self.theme,
+                allow_new=True,
+                allow_delete=True,
+            )
+            if res.action == "cancel":
+                return
+            if res.action == "new":
+                self.session_id = f"cli:{uuid4().hex[:8]}"
+                self._session_title = None
+                await self.memory_store.ensure_session(self.session_id)
+                await self._refresh_session_metadata()
+                self.console.print(
+                    f"Started new session: [{self.theme.ui_label}]{self.session_id}[/]"
+                )
+                return
+            if res.action == "delete" and res.value:
+                deleted_sid = res.value
+                await self.memory_store.delete_session(deleted_sid)
+                self.console.print(f"[dim]Deleted session {deleted_sid}.[/dim]")
+                if deleted_sid == self.session_id:
+                    remaining = await self.memory_store.list_sessions()
+                    if remaining:
+                        self.session_id = str(remaining[0]["session_id"])
+                    else:
+                        self.session_id = f"cli:{uuid4().hex[:8]}"
+                        await self.memory_store.ensure_session(self.session_id)
+                    await self._refresh_session_metadata()
+                continue
+            if res.action == "select" and res.value:
+                if res.value != self.session_id:
+                    await self._switch_session(res.value)
+                else:
+                    self.console.print(f"[dim]Already on session {self.session_id}.[/dim]")
+                return
+
+    async def _run_theme_picker(self) -> None:
+        options = [
+            PickerOption(value=t.name, label=t.name, meta=t.description)
+            for t in list_themes()
+        ]
+        res = await run_interactive_picker(
+            title="Select TUI Theme",
+            options=options,
+            current_value=self.theme.name,
+            theme=self.theme,
+        )
+        if res.action == "select" and res.value:
+            self.theme = get_theme(res.value)
+            self._persist_env({"IVY_THEME": self.theme.name})
+            if self._prompt_session is not None:
+                self._prompt_session.style = build_prompt_style(self.theme)
+            self.console.print(
+                f"Switched theme to: [bold {self.theme.ui_accent}]{self.theme.name}[/] — {self.theme.description}"
+            )
+
+    async def _run_model_picker(self) -> None:
+        presets = [
+            self.llm_client.model,
+            "gpt-4o-mini",
+            "gpt-4o",
+            "claude-sonnet-4-5",
+            "gemini/gemini-2.5-flash",
+            "ollama/qwen2.5",
+        ]
+        unique = list(dict.fromkeys(m for m in presets if m))
+        options = [PickerOption(value=m, label=m) for m in unique]
+        res = await run_interactive_picker(
+            title="Select or Type Model",
+            options=options,
+            current_value=self.llm_client.model,
+            theme=self.theme,
+            allow_custom=True,
+        )
+        if res.action == "select" and res.value:
+            self.llm_client.set_model(res.value)
+            self._persist_env({"DEFAULT_MODEL": self.llm_client.model})
+            await self._refresh_session_metadata()
+            self.console.print(f"Switched model to: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
 
     def _persist_env(self, updates: dict[str, str]) -> None:
         if self.env_path is not None:
@@ -468,10 +587,13 @@ class IvyCLIApp:
 
         if cmd == "/theme":
             if not args:
-                names = ", ".join(t.name for t in list_themes())
-                self.console.print(
-                    f"Active theme: [bold {self.theme.ui_accent}]{self.theme.name}[/] (available: {names})"
-                )
+                if self._can_open_picker():
+                    await self._run_theme_picker()
+                else:
+                    names = ", ".join(t.name for t in list_themes())
+                    self.console.print(
+                        f"Active theme: [bold {self.theme.ui_accent}]{self.theme.name}[/] (available: {names})"
+                    )
             else:
                 self.theme = get_theme(args[0])
                 self._persist_env({"IVY_THEME": self.theme.name})
@@ -484,7 +606,10 @@ class IvyCLIApp:
 
         if cmd == "/model":
             if not args:
-                self.console.print(f"Active model: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
+                if self._can_open_picker():
+                    await self._run_model_picker()
+                else:
+                    self.console.print(f"Active model: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             else:
                 self.llm_client.set_model(args[0])
                 self._persist_env({"DEFAULT_MODEL": self.llm_client.model})
@@ -501,7 +626,16 @@ class IvyCLIApp:
             return True
 
         if cmd == "/session":
-            if not args or args[0].lower() == "list":
+            if not args:
+                if self._can_open_picker():
+                    await self._run_session_picker()
+                else:
+                    sessions = await self.memory_store.list_sessions()
+                    self._cached_sessions = sessions
+                    render_sessions_table(
+                        self.console, sessions, self.session_id, theme=self.theme
+                    )
+            elif args[0].lower() == "list":
                 sessions = await self.memory_store.list_sessions()
                 self._cached_sessions = sessions
                 render_sessions_table(
@@ -518,6 +652,7 @@ class IvyCLIApp:
             else:
                 self.session_id = f"cli:{uuid4().hex[:8]}"
             self._session_title = None
+            await self.memory_store.ensure_session(self.session_id)
             await self._refresh_session_metadata()
             self.console.print(
                 f"Started new session: [{self.theme.ui_label}]{self.session_id}[/]"
@@ -954,6 +1089,7 @@ class IvyCLIApp:
             bottom_toolbar=self._render_toolbar,
             skill_engine=self.skill_engine,
             history_path=self.history_path,
+            session_provider=lambda: self._cached_sessions,
         )
         self._prompt_session = prompt_session
 

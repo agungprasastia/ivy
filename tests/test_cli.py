@@ -551,3 +551,69 @@ async def test_hermes_ux_slash_commands_bang_and_approval_flow(tmp_path):
         assert await app._interactive_approval("rm -rf y") == (False, "use python pathlib instead")
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_interactive_picker_state_session_completion_and_picker_flow(tmp_path):
+    from io import StringIO
+    from unittest.mock import patch
+    from prompt_toolkit.completion import CompleteEvent
+    from prompt_toolkit.document import Document
+    from rich.console import Console
+    from ivy.tui.helpers import format_relative_time
+    from ivy.tui.picker import PickerOption, PickerResult, PickerState, render_picker_fragments
+
+    # 1. PickerState filtering, navigation, and custom entries
+    opts = [
+        PickerOption(value="cli:main", label="Bugfix Login", meta="cli:main · 12m · 5m ago"),
+        PickerOption(value="cli:work", label="Refactor API", meta="cli:work · 4m · yesterday"),
+    ]
+    st = PickerState(options=opts, current_value="cli:work", allow_custom=True)
+    assert st.selected is not None and st.selected.value == "cli:work"
+    st.move(-1)
+    assert st.selected is not None and st.selected.value == "cli:main"
+    st.apply_filter("refactor")
+    assert len(st.items) == 2  # matched item + 'Use custom: refactor'
+    assert st.items[0].value == "cli:work"
+    rendered = "".join(txt for _, txt in render_picker_fragments("Switch Session", st, allow_new=True, allow_delete=True))
+    assert "Refactor API" in rendered
+    assert "Ctrl+N new" in rendered
+    assert "Del delete" in rendered
+
+    # 2. Relative timestamp formatting
+    assert format_relative_time(None) == ""
+
+    # 3. Session autocomplete dropdown under `/session `
+    completer = build_slash_completer(
+        session_provider=lambda: [{"session_id": "cli:alpha", "title": "Alpha task", "message_count": 3}]
+    )
+    completions = list(completer.get_completions(Document("/session cli:", cursor_position=13), CompleteEvent()))
+    assert any(c.text == "cli:alpha" and "Alpha task" in str(c.display_meta) for c in completions)
+
+    # 4. Interactive /session picker flow (delete -> new -> select)
+    cfg = IvyConfig(db_path=str(tmp_path / "picker.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="first"))
+    await store.save_message("cli:other", ChatMessage(role=Role.USER, content="second"))
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=LLMClient(cfg),
+        memory_store=store,
+        skill_engine=SkillEngine(skills_dir=cfg.skills_dir),
+        agent=MagicMock(),
+        console=Console(file=StringIO(), force_terminal=False, width=100),
+    )
+
+    actions = iter([
+        PickerResult(action="delete", value="cli:main"),
+        PickerResult(action="select", value="cli:other"),
+    ])
+    with patch.object(app, "_can_open_picker", return_value=True), patch(
+        "ivy.tui.app.run_interactive_picker", new=AsyncMock(side_effect=lambda **kw: next(actions))
+    ):
+        assert await app.handle_slash_command("/session") is True
+
+    assert app.session_id == "cli:other"
+    assert {s["session_id"] for s in await store.list_sessions()} == {"cli:other"}
+    await store.close()

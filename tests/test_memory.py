@@ -149,4 +149,13 @@ async def test_memory_store_title_undo_fork_and_context_compaction(tmp_path):
     assert stats["removed_messages"] == 6
     assert "Summary of earlier turns" in (compacted[0].content or "")
 
+    # Fallback first-prompt title, ensure_session & delete_session
+    await store.save_message("cli:unlabeled", ChatMessage(role=Role.USER, content="tolong fix bug api"))
+    await store.ensure_session("cli:empty_new")
+    listed = {s["session_id"]: s for s in await store.list_sessions()}
+    assert listed["cli:unlabeled"]["title"] == "tolong fix bug api"
+    assert "cli:empty_new" in listed
+    assert await store.delete_session("cli:empty_new") is True
+    assert "cli:empty_new" not in {s["session_id"] for s in await store.list_sessions()}
+
     await store.close()

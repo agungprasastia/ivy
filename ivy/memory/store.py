@@ -232,7 +232,14 @@ class MemoryStore:
                     s.platform,
                     s.updated_at,
                     COUNT(m.id) AS message_count,
-                    s.title
+                    s.title,
+                    (
+                        SELECT m2.content
+                        FROM messages m2
+                        WHERE m2.session_id = s.session_id AND m2.role = 'user' AND m2.content != ''
+                        ORDER BY m2.id ASC
+                        LIMIT 1
+                    ) AS first_prompt
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
                 GROUP BY s.session_id, s.platform, s.updated_at, s.title
@@ -247,10 +254,36 @@ class MemoryStore:
                     "platform": row[1],
                     "updated_at": row[2],
                     "message_count": int(row[3]),
-                    "title": row[4] or "",
+                    "title": (row[4] or "").strip()
+                    or (" ".join((row[5] or "").split())[:48] if row[5] else ""),
                 }
                 for row in rows
             ]
+
+    async def ensure_session(self, session_id: str, platform: str = "cli") -> None:
+        """Create a session row if missing so newly started sessions appear in pickers."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO sessions (session_id, platform, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, platform, now, now),
+            )
+            conn.commit()
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Permanently delete a session and all of its messages."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM messages_fts WHERE session_id = ?", (session_id,))
+            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return (cur.rowcount or 0) > 0
 
     async def set_session_title(
         self, session_id: str, title: str, platform: str = "cli"

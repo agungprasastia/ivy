@@ -367,3 +367,41 @@ async def test_live_stream_renders_rich_markdown_not_raw_asterisks(tmp_path):
     assert "Inspeksi kode" in rendered
     assert "**Inspeksi kode**" not in rendered
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_and_new_slash_commands(tmp_path):
+    from io import StringIO
+    from rich.console import Console
+
+    cfg = IvyConfig(db_path=str(tmp_path / "sess_tui.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="old"))
+
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=100)
+
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=MagicMock(),
+        console=console,
+    )
+    assert app.session_id == "cli:main"
+
+    assert await app.handle_slash_command("/session work") is True
+    assert app.session_id == "work"
+
+    assert await app.handle_slash_command("/session list") is True
+    assert "cli:main" in buf.getvalue()
+
+    assert await app.handle_slash_command("/new") is True
+    assert app.session_id != "work"
+    assert app.session_id.startswith("cli:")
+
+    await store.close()

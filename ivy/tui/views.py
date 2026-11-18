@@ -199,6 +199,8 @@ def render_help_table(
     rows = [
         ("/setup [base] [key] [model]", "Configure API endpoint/key & save to .env"),
         ("/model [name]", "Show active model or switch & save to .env"),
+        ("/session [list|<name>]", "List saved sessions or switch active session"),
+        ("/new [name]", "Start a new fresh session"),
         ("/skills list", "List all discovered skills"),
         ("/skills inspect <name>", "Inspect instructions of a skill"),
         ("/skills remove <name>", "Delete a skill"),
@@ -255,4 +257,41 @@ def render_memory_results(
     for r in results:
         snippet = (r.get("content") or "").replace("\n", " ")[:120]
         table.add_row(r.get("session_id", ""), r.get("role", ""), snippet)
+    console.print(table)
+
+
+def render_sessions_table(
+    console: Console,
+    sessions: list[dict[str, Any]],
+    current_session_id: str,
+    theme: ThemeConfig | None = None,
+) -> None:
+    """Display saved sessions in a Rich table, marking the active session."""
+    t = theme or get_theme()
+    if not sessions:
+        console.print(
+            f"[{t.ui_warn}]No saved sessions yet.[/] Active session: [{t.ui_label}]{current_session_id}[/]"
+        )
+        return
+    table = Table(
+        title=f"[{t.banner_title}]Saved Sessions[/]",
+        box=box.ROUNDED,
+        border_style=t.banner_border,
+    )
+    table.add_column("", width=2)
+    table.add_column("Session ID", style=f"bold {t.ui_label}")
+    table.add_column("Platform", style=t.ui_accent)
+    table.add_column("Messages", justify="right")
+    table.add_column("Last Updated", style="dim")
+    for s in sessions:
+        sid = s.get("session_id", "")
+        marker = f"[{t.ui_ok}]*[/]" if sid == current_session_id else ""
+        updated = str(s.get("updated_at") or "")[:19].replace("T", " ")
+        table.add_row(
+            marker,
+            sid,
+            str(s.get("platform") or ""),
+            str(s.get("message_count", 0)),
+            updated,
+        )
     console.print(table)

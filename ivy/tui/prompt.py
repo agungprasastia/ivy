@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 SLASH_COMMANDS = [
     "/setup",
     "/model",
+    "/session",
+    "/new",
     "/skills",
     "/gateway",
     "/cron",
@@ -33,6 +35,8 @@ SLASH_COMMANDS = [
 SLASH_COMMAND_META: dict[str, str] = {
     "/setup": "Configure API base URL, API key, and default model (.env)",
     "/model": "Switch or inspect active LLM model (persisted to .env)",
+    "/session": "List saved sessions or switch active session",
+    "/new": "Start a new fresh session",
     "/skills": "List, inspect, remove, or reflect skills",
     "/gateway": "Show Telegram/Discord gateway status",
     "/cron": "List scheduled cron tasks",
@@ -44,6 +48,9 @@ SLASH_COMMAND_META: dict[str, str] = {
 }
 
 _SUBCOMMAND_META: dict[str, dict[str, str]] = {
+    "/session": {
+        "list": "List saved sessions",
+    },
     "/skills": {
         "list": "List all loaded skills",
         "inspect": "Inspect a skill's instructions",

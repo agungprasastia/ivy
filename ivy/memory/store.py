@@ -207,6 +207,35 @@ class MemoryStore:
             conn.execute("DELETE FROM messages_fts WHERE session_id = ?", (session_id,))
             conn.commit()
 
+    async def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        """List saved sessions ordered by most recently updated."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT
+                    s.session_id,
+                    s.platform,
+                    s.updated_at,
+                    COUNT(m.id) AS message_count
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.session_id
+                GROUP BY s.session_id, s.platform, s.updated_at
+                ORDER BY s.updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [
+                {
+                    "session_id": row[0],
+                    "platform": row[1],
+                    "updated_at": row[2],
+                    "message_count": int(row[3]),
+                }
+                for row in rows
+            ]
+
     async def search_fts(
         self, query: str, limit: int = 10, session_id: str | None = None
     ) -> list[dict[str, Any]]:

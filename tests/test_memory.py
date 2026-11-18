@@ -80,3 +80,20 @@ async def test_user_profile_and_context_compression(tmp_path):
     assert "User msg 11" in (compressed[-1].content or "")
 
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_list_sessions(tmp_path):
+    store = MemoryStore(db_path=str(tmp_path / "sess.db"))
+    await store.initialize()
+
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="hi"))
+    await store.save_message("cli:work", ChatMessage(role=Role.USER, content="code"))
+    await store.save_message("cli:work", ChatMessage(role=Role.ASSISTANT, content="ok"))
+
+    sessions = await store.list_sessions()
+    by_id = {s["session_id"]: s for s in sessions}
+    assert "cli:main" in by_id
+    assert "cli:work" in by_id
+    assert by_id["cli:work"]["message_count"] == 2
+    await store.close()

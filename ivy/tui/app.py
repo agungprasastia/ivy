@@ -7,6 +7,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
+from uuid import uuid4
 
 from prompt_toolkit.formatted_text import FormattedText, HTML
 from rich.console import Console
@@ -37,6 +38,7 @@ from ivy.tui.views import (
     render_error,
     render_help_table,
     render_memory_results,
+    render_sessions_table,
     render_skills_table,
     render_tool_event,
 )
@@ -281,6 +283,30 @@ class IvyCLIApp:
             await self.memory_store.clear_session(self.session_id)
             self.console.print(
                 f"Cleared history for session [{self.theme.ui_label}]{self.session_id}[/]."
+            )
+            return True
+
+        if cmd == "/session":
+            if not args or args[0].lower() == "list":
+                sessions = await self.memory_store.list_sessions()
+                render_sessions_table(
+                    self.console, sessions, self.session_id, theme=self.theme
+                )
+            else:
+                self.session_id = args[0]
+                self.console.print(
+                    f"Switched session to: [{self.theme.ui_label}]{self.session_id}[/]"
+                )
+            return True
+
+        if cmd == "/new":
+            if args:
+                name = args[0].strip()
+                self.session_id = name if ":" in name else f"cli:{name}"
+            else:
+                self.session_id = f"cli:{uuid4().hex[:8]}"
+            self.console.print(
+                f"Started new session: [{self.theme.ui_label}]{self.session_id}[/]"
             )
             return True
 

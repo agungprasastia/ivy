@@ -286,3 +286,41 @@ async def test_llm_client_stream_turn_assembles_text_and_tool_calls():
         )
         assert msg.content == "Hello Ivy!"
         assert tokens == ["Hello ", "Ivy!"]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_captures_usage_and_handles_stream_options_fallback():
+    cfg = IvyConfig(default_model="gpt-4o-mini", openai_api_key="sk-test")
+    client = LLMClient(cfg)
+
+    calls = []
+
+    async def fake_stream():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="Hi", tool_calls=None))],
+            usage=None,
+        )
+        yield SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=15, completion_tokens=5, total_tokens=20),
+        )
+
+    async def fake_create(**kwargs):
+        calls.append(kwargs)
+        if "stream_options" in kwargs:
+            raise RuntimeError("Unknown parameter: stream_options")
+        return fake_stream()
+
+    with patch.object(client, "_get_openai_client") as get_client:
+        get_client.return_value = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+        )
+        msg = await client.stream_turn(messages=[ChatMessage(role=Role.USER, content="Hi")])
+
+    assert len(calls) == 2
+    assert "stream_options" not in calls[1]
+    assert msg.metadata["usage"] == {
+        "prompt_tokens": 15,
+        "completion_tokens": 5,
+        "total_tokens": 20,
+    }

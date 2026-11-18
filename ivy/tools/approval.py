@@ -9,11 +9,11 @@ import inspect
 import logging
 import re
 import sys
-from typing import AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
-_ApprovalCallback = Callable[[str], bool | Awaitable[bool]]
+_ApprovalCallback = Callable[[str], Any | Awaitable[Any]]
 _scoped_callback_var: contextvars.ContextVar[_ApprovalCallback | None] = (
     contextvars.ContextVar("ivy_scoped_approval_callback", default=None)
 )
@@ -59,6 +59,7 @@ class SafetyApprovalPolicy:
         self.unattended = unattended
         self.approval_timeout = approval_timeout
         self.approval_callback = approval_callback
+        self.session_approved_commands: set[str] = set()
 
         patterns = list(self.DEFAULT_DANGEROUS_PATTERNS)
         if custom_dangerous_patterns:
@@ -85,13 +86,50 @@ class SafetyApprovalPolicy:
         normalized = command.strip()
         return any(pattern.search(normalized) for pattern in self.compiled_patterns)
 
-    async def check_approval(self, command: str) -> bool:
-        """Evaluate approval for command execution across CLI, bot, and cron modes."""
-        if not self.is_dangerous(command):
-            return True
+    def _interpret_callback_result(self, command: str, raw: Any) -> tuple[bool, str | None]:
+        """Interpret bool, scope string, tuple(decision, feedback), or dict decision."""
+        norm = command.strip()
+        if isinstance(raw, bool):
+            return raw, None
+        if isinstance(raw, str):
+            val = raw.strip().lower()
+            if val == "session":
+                self.session_approved_commands.add(norm)
+                return True, None
+            if val in ("always", "yolo"):
+                self.auto_approve = True
+                return True, None
+            if val in ("once", "yes", "y", "true"):
+                return True, None
+            if val in ("no", "n", "deny", "false", ""):
+                return False, None
+            return False, raw.strip()
+        if isinstance(raw, tuple) and len(raw) >= 2:
+            approved, reason = raw[0], raw[1]
+            if isinstance(approved, str):
+                ok, _ = self._interpret_callback_result(command, approved)
+                return ok, (str(reason).strip() if reason else None)
+            return bool(approved), (str(reason).strip() if reason else None)
+        if isinstance(raw, dict):
+            approved = bool(raw.get("approved", False))
+            scope = str(raw.get("scope", "once")).lower()
+            if approved:
+                if scope == "session":
+                    self.session_approved_commands.add(norm)
+                elif scope in ("always", "yolo"):
+                    self.auto_approve = True
+                return True, None
+            fb = raw.get("feedback")
+            return False, (str(fb).strip() if fb else None)
+        return bool(raw), None
 
-        if self.auto_approve:
-            return True
+    async def evaluate_approval(self, command: str) -> tuple[bool, str | None]:
+        """Evaluate command safety approval, returning (approved, optional_user_feedback)."""
+        if not self.is_dangerous(command):
+            return True, None
+
+        if self.auto_approve or command.strip() in self.session_approved_commands:
+            return True, None
 
         scoped_unattended = _scoped_unattended_var.get()
         is_unattended = self.unattended if scoped_unattended is None else scoped_unattended
@@ -99,21 +137,21 @@ class SafetyApprovalPolicy:
             logger.warning(
                 "Unattended safety policy blocked dangerous command: %s", command
             )
-            return False
+            return False, None
 
         callback = _scoped_callback_var.get() or self.approval_callback
         if callback is not None:
             try:
                 res = callback(command)
                 if inspect.isawaitable(res):
-                    return bool(await asyncio.wait_for(res, timeout=self.approval_timeout))
-                return bool(res)
+                    res = await asyncio.wait_for(res, timeout=self.approval_timeout)
+                return self._interpret_callback_result(command, res)
             except asyncio.TimeoutError:
                 logger.warning("Approval request timed out for command: %s", command)
-                return False
+                return False, None
             except Exception as exc:
                 logger.warning("Approval callback failed safely (rejecting): %s", exc)
-                return False
+                return False, None
 
         if self.interactive and sys.stdin.isatty():
             print(
@@ -123,8 +161,13 @@ class SafetyApprovalPolicy:
                 response = await asyncio.to_thread(
                     lambda: input("Do you approve this execution? [y/N]: ").strip().lower()
                 )
-                return response in ("y", "yes")
+                return (response in ("y", "yes")), None
             except (EOFError, KeyboardInterrupt):
-                return False
+                return False, None
 
-        return False
+        return False, None
+
+    async def check_approval(self, command: str) -> bool:
+        """Evaluate approval for command execution across CLI, bot, and cron modes."""
+        approved, _ = await self.evaluate_approval(command)
+        return approved

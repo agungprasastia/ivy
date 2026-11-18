@@ -45,7 +45,8 @@ class MemoryStore:
                     session_id TEXT PRIMARY KEY,
                     platform TEXT DEFAULT 'cli',
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    title TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -82,6 +83,12 @@ class MemoryStore:
                 );
                 """
             )
+            # Lightweight schema migration for existing DBs missing sessions.title
+            cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "title" not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
             conn.commit()
             self._conn = conn
 
@@ -170,9 +177,9 @@ class MemoryStore:
             conn = self._ensure_conn()
             rows = conn.execute(
                 """
-                SELECT role, content, tool_calls_json, tool_call_id, name
+                SELECT role, content, tool_calls_json, tool_call_id, name, created_at
                 FROM (
-                    SELECT id, role, content, tool_calls_json, tool_call_id, name
+                    SELECT id, role, content, tool_calls_json, tool_call_id, name, created_at
                     FROM messages
                     WHERE session_id = ?
                     ORDER BY id DESC
@@ -184,10 +191,16 @@ class MemoryStore:
             ).fetchall()
 
         result: list[ChatMessage] = []
-        for role_val, content, tc_json, tc_id, name in rows:
+        for role_val, content, tc_json, tc_id, name, created_at in rows:
             tool_calls = None
             if tc_json:
                 tool_calls = [ToolCall(**item) for item in json.loads(tc_json)]
+            ts = datetime.now(timezone.utc)
+            if created_at:
+                try:
+                    ts = datetime.fromisoformat(created_at)
+                except ValueError:
+                    pass
             result.append(
                 ChatMessage(
                     role=Role(role_val),
@@ -195,6 +208,7 @@ class MemoryStore:
                     tool_calls=tool_calls,
                     tool_call_id=tc_id,
                     name=name,
+                    timestamp=ts,
                 )
             )
         return result
@@ -217,10 +231,11 @@ class MemoryStore:
                     s.session_id,
                     s.platform,
                     s.updated_at,
-                    COUNT(m.id) AS message_count
+                    COUNT(m.id) AS message_count,
+                    s.title
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
-                GROUP BY s.session_id, s.platform, s.updated_at
+                GROUP BY s.session_id, s.platform, s.updated_at, s.title
                 ORDER BY s.updated_at DESC
                 LIMIT ?
                 """,
@@ -232,9 +247,113 @@ class MemoryStore:
                     "platform": row[1],
                     "updated_at": row[2],
                     "message_count": int(row[3]),
+                    "title": row[4] or "",
                 }
                 for row in rows
             ]
+
+    async def set_session_title(
+        self, session_id: str, title: str, platform: str = "cli"
+    ) -> None:
+        """Set or update the human-friendly title for a session."""
+        clean = " ".join(title.strip().split())[:80]
+        async with self._lock:
+            conn = self._ensure_conn()
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO sessions (session_id, platform, created_at, updated_at, title)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    title = excluded.title,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, platform, now, now, clean),
+            )
+            conn.commit()
+
+    async def get_session_title(self, session_id: str) -> str | None:
+        """Retrieve session title if set."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT title FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row[0] if row and row[0] else None
+
+    async def get_latest_session_id(self) -> str | None:
+        """Return the most recently updated session ID, or None if empty."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+            return row[0] if row else None
+
+    async def delete_last_turn(self, session_id: str) -> tuple[str | None, int]:
+        """Remove the last user prompt and its subsequent messages from a session."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                """
+                SELECT id, content
+                FROM messages
+                WHERE session_id = ? AND role = 'user'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None, 0
+
+            cut_id, user_prompt = row[0], row[1]
+            cur = conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+                (session_id, cut_id),
+            )
+            deleted = int(cur.rowcount or 0)
+            # Rebuild FTS entries for this session so FTS stays exact
+            conn.execute("DELETE FROM messages_fts WHERE session_id = ?", (session_id,))
+            remaining = conn.execute(
+                """
+                SELECT role, content, created_at
+                FROM messages
+                WHERE session_id = ? AND exclude_from_fts = 0 AND content != ''
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            for r_role, r_content, r_ts in remaining:
+                conn.execute(
+                    "INSERT INTO messages_fts (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                    (session_id, r_role, r_content, r_ts),
+                )
+            conn.commit()
+            return user_prompt, deleted
+
+    async def replace_session_messages(
+        self, session_id: str, messages: list[ChatMessage], platform: str = "cli"
+    ) -> None:
+        """Atomically replace all messages of a session (used by /compact)."""
+        await self.clear_session(session_id)
+        await self.save_turn(session_id, messages, platform=platform)
+
+    async def fork_session(
+        self,
+        src_session_id: str,
+        dst_session_id: str,
+        title: str | None = None,
+        platform: str = "cli",
+    ) -> int:
+        """Clone messages from src_session_id into a new dst_session_id."""
+        src_messages = await self.get_messages(src_session_id, limit=500)
+        src_title = await self.get_session_title(src_session_id)
+        await self.save_turn(dst_session_id, src_messages, platform=platform)
+        fork_title = title or (f"{src_title} (fork)" if src_title else f"Fork of {src_session_id}")
+        await self.set_session_title(dst_session_id, fork_title, platform=platform)
+        return len(src_messages)
 
     async def search_fts(
         self, query: str, limit: int = 10, session_id: str | None = None

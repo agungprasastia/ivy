@@ -5,6 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import platform
+import subprocess
+import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 from uuid import uuid4
@@ -19,6 +25,7 @@ from ivy.core.agent import IvyAgent
 from ivy.core.llm import LLMClient
 from ivy.cron.scheduler import CronScheduler
 from ivy.gateway.server import GatewayServer
+from ivy.memory.context import ContextWindowManager, compute_context_breakdown
 from ivy.memory.store import MemoryStore
 from ivy.skills.engine import SkillEngine
 from ivy.skills.generator import SkillGenerator
@@ -29,18 +36,40 @@ from ivy.tools.registry import ToolRegistry
 from ivy.tools.runner import CodeRunnerTool
 from ivy.tools.terminal import TerminalTool
 from ivy.tools.web import WebFetchTool, WebSearchTool
-from ivy.tui.prompt import build_bottom_toolbar, build_prompt_style, create_prompt_session
+from ivy.tui.helpers import (
+    copy_to_clipboard,
+    expand_at_mentions,
+    export_session_json,
+    export_session_markdown,
+    format_token_count,
+    get_git_branch,
+    resolve_slash_command,
+    run_git_diff,
+)
+from ivy.tui.prompt import (
+    SLASH_COMMANDS,
+    build_bottom_toolbar,
+    build_prompt_style,
+    create_prompt_session,
+)
 from ivy.tui.theme import ThemeConfig, get_theme, list_themes
 from ivy.tui.views import (
     create_console,
     render_assistant_reply,
     render_banner,
+    render_context_panel,
+    render_diff_output,
     render_error,
     render_help_table,
+    render_history_view,
     render_memory_results,
+    render_session_recap,
     render_sessions_table,
     render_skills_table,
+    render_status_panel,
     render_tool_event,
+    render_turn_footer,
+    render_usage_table,
 )
 
 _NOISY_HTTP_LOGGERS = (
@@ -69,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Ivy — Autonomous self-improving Python AI agent",
     )
     parser.add_argument("-p", "--prompt", type=str, default=None, help="Run a single prompt non-interactively and exit")
+    parser.add_argument("-c", "--continue", dest="continue_latest", action="store_true", help="Resume the most recently updated session")
     parser.add_argument("--model", type=str, default=None, help="Override default LLM model")
     parser.add_argument("--session", type=str, default="cli:main", help="Session ID to resume")
     parser.add_argument("--theme", type=str, default=None, help="TUI theme (ivy, hermes, ocean)")
@@ -141,6 +171,8 @@ class IvyCLIApp:
         console: Console | None = None,
         theme_name: str | None = None,
         env_path: str | Path | None = None,
+        approval_policy: SafetyApprovalPolicy | None = None,
+        history_path: str | Path | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
@@ -153,8 +185,33 @@ class IvyCLIApp:
         self.console = console or create_console()
         self.theme: ThemeConfig = get_theme(theme_name or config.default_theme)
         self.env_path = env_path
+        self.approval_policy = approval_policy or self._discover_approval_policy()
+        self.history_path = history_path
+        self.display_mode: str = "verbose" if getattr(config, "verbose", False) else "compact"
         self._active_status: Any = None
         self._prompt_session: Any = None
+        self._session_title: str | None = None
+        self._git_branch: str | None = get_git_branch()
+        self._usage_stats: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "api_calls": 0,
+        }
+        self._compressions: int = 0
+        self._ctx_percent: float | None = None
+        self._last_duration_s: float | None = None
+        self._cached_sessions: list[dict[str, Any]] = []
+
+    def _discover_approval_policy(self) -> SafetyApprovalPolicy | None:
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get"):
+            return None
+        try:
+            term = registry.get("terminal")
+            return getattr(term, "approval_policy", None)
+        except Exception:
+            return None
 
     def _tool_names(self) -> list[str]:
         registry = getattr(self.agent, "tool_registry", None)
@@ -165,6 +222,19 @@ class IvyCLIApp:
         except Exception:
             return []
 
+    def _tool_schemas(self) -> list[dict[str, Any]]:
+        registry = getattr(self.agent, "tool_registry", None)
+        if registry is None or not hasattr(registry, "get_schemas"):
+            return []
+        try:
+            schemas = registry.get_schemas()
+            return schemas if isinstance(schemas, list) else []
+        except Exception:
+            return []
+
+    def _is_yolo(self) -> bool:
+        return bool(self.approval_policy and self.approval_policy.auto_approve)
+
     def _render_toolbar(self) -> FormattedText:
         return build_bottom_toolbar(
             model=self.llm_client.model,
@@ -172,25 +242,68 @@ class IvyCLIApp:
             tool_count=len(self._tool_names()),
             skill_count=len(self.skill_engine.list_skills()),
             theme=self.theme,
+            ctx_percent=self._ctx_percent,
+            total_tokens=self._usage_stats["total_tokens"],
+            last_duration_s=self._last_duration_s,
+            yolo=self._is_yolo(),
+            focus_mode=(self.display_mode == "focus"),
+            session_title=self._session_title,
+            git_branch=self._git_branch,
         )
+
+    async def _refresh_session_metadata(self) -> None:
+        try:
+            self._session_title = await self.memory_store.get_session_title(self.session_id)
+            history = await self.memory_store.get_messages(self.session_id, limit=100)
+            breakdown = compute_context_breakdown(
+                history,
+                model=self.llm_client.model,
+                tool_schemas=self._tool_schemas(),
+            )
+            self._ctx_percent = float(breakdown["percent"])
+        except Exception:
+            pass
 
     def _persist_env(self, updates: dict[str, str]) -> None:
         if self.env_path is not None:
             update_env_file(updates, env_path=self.env_path)
 
-    async def _interactive_approval(self, command: str) -> bool:
-        """Pause any active Rich spinner before asking the terminal user for approval."""
+    async def _interactive_approval(self, command: str) -> Any:
+        """Pause active spinner and present rich multi-option safety approval prompt."""
+        from rich import box as rich_box
+        from rich.markup import escape as rich_escape
+        from rich.panel import Panel as RichPanel
+
         status = self._active_status
         if status is not None:
             status.stop()
         try:
+            self.console.print()
             self.console.print(
-                f"\n[bold {self.theme.ui_warn}][SAFETY GUARD][/] Potentially destructive command:\n  {command}"
+                RichPanel(
+                    f"[bold]{rich_escape(command)}[/bold]\n\n"
+                    "[dim][y] allow once · [s] allow cmd this session · [a] allow all (/yolo) · [n] deny · [t] deny & tell Ivy[/dim]",
+                    title=f"[bold {self.theme.ui_warn}]⚠ Safety Approval[/]",
+                    border_style=self.theme.ui_warn,
+                    box=rich_box.ROUNDED,
+                    expand=False,
+                )
             )
             answer = await asyncio.to_thread(
-                lambda: input("Approve execution? [y/N]: ").strip().lower()
+                lambda: input("Choice [y/s/a/N/t]: ").strip().lower()
             )
-            return answer in ("y", "yes")
+            if answer in ("y", "yes"):
+                return True
+            if answer in ("s", "session"):
+                return "session"
+            if answer in ("a", "always", "yolo"):
+                return "always"
+            if answer in ("t", "tell"):
+                feedback = await asyncio.to_thread(
+                    lambda: input("Tell Ivy what to do instead: ").strip()
+                )
+                return (False, feedback or "Use a safer alternative.")
+            return False
         except (EOFError, KeyboardInterrupt):
             return False
         finally:
@@ -236,11 +349,110 @@ class IvyCLIApp:
             f"(model=[bold]{self.llm_client.model}[/bold], base=[dim]{self.llm_client.base_url or 'default'}[/dim])"
         )
 
+    async def _compose_in_editor(self, initial_text: str = "") -> str | None:
+        """Open $VISUAL/$EDITOR (or notepad on Windows) with a markdown draft."""
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            editor = "notepad" if platform.system() == "Windows" else "vi"
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".md",
+                prefix="ivy_prompt_",
+                delete=False,
+                encoding="utf-8",
+            ) as tf:
+                tf.write(initial_text)
+                tmp_path = tf.name
+            subprocess.run([editor, tmp_path], check=False)
+            content = Path(tmp_path).read_text(encoding="utf-8", errors="replace").strip()
+            return content or None
+        except Exception as exc:
+            self.console.print(f"[{self.theme.ui_error}]Failed to open editor ({editor}):[/] {exc}")
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    async def _run_bang_command(self, command: str) -> None:
+        """Run a local shell command cleanly via !cmd with safety guard & zero LLM tokens."""
+        if not command:
+            self.console.print(f"[{self.theme.ui_warn}]Usage: !<shell command>[/]")
+            return
+        if self.approval_policy is not None:
+            approved, feedback = await self.approval_policy.evaluate_approval(command)
+            if not approved:
+                msg = feedback or "Command rejected by safety policy."
+                self.console.print(f"[{self.theme.ui_warn}]⊘ {msg}[/]")
+                return
+        t0 = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            out = stdout_b.decode("utf-8", errors="replace").strip()
+            err = stderr_b.decode("utf-8", errors="replace").strip()
+            dur = time.monotonic() - t0
+            if out:
+                self.console.print(out, markup=False)
+            if err:
+                self.console.print(f"[{self.theme.ui_error}]{err}[/]")
+            self.console.print(f"[dim]$ exit {proc.returncode} · {dur:.2f}s (0 tokens)[/dim]")
+        except asyncio.TimeoutError:
+            self.console.print(f"[{self.theme.ui_error}]Shell command timed out (60s).[/]")
+        except Exception as exc:
+            self.console.print(f"[{self.theme.ui_error}]Shell error:[/] {exc}")
+
+    async def _switch_session(self, target: str) -> None:
+        """Switch session by index (#N from /session list) or explicit session ID."""
+        resolved = target.strip()
+        if resolved.isdigit():
+            idx = int(resolved) - 1
+            if not self._cached_sessions:
+                self._cached_sessions = await self.memory_store.list_sessions()
+            if 0 <= idx < len(self._cached_sessions):
+                resolved = str(self._cached_sessions[idx]["session_id"])
+            else:
+                self.console.print(f"[{self.theme.ui_warn}]Session #{target} not found.[/]")
+                return
+        self.session_id = resolved
+        await self._refresh_session_metadata()
+        self.console.print(
+            f"Switched session to: [{self.theme.ui_label}]{self.session_id}[/]"
+            + (f" [dim]({self._session_title})[/dim]" if self._session_title else "")
+        )
+        history = await self.memory_store.get_messages(self.session_id, limit=50)
+        if history:
+            render_session_recap(
+                self.console, self.session_id, self._session_title, history, theme=self.theme
+            )
+
     async def handle_slash_command(self, raw_line: str) -> bool:
-        """Handle a slash command. Returns False to exit interactive loop."""
+        """Handle a slash command (exact, alias, unique prefix, typo hint). Returns False to exit."""
         parts = raw_line.strip().split()
-        cmd = parts[0].lower()
+        raw_cmd = parts[0].lower()
         args = parts[1:]
+
+        resolved_cmd, suggestions, mode = resolve_slash_command(raw_cmd, SLASH_COMMANDS)
+        if resolved_cmd is None:
+            if mode == "ambiguous":
+                opts = ", ".join(suggestions)
+                self.console.print(f"[{self.theme.ui_warn}]Ambiguous command '{raw_cmd}':[/] {opts}")
+            elif suggestions:
+                opts = ", ".join(suggestions)
+                self.console.print(f"[{self.theme.ui_warn}]Unknown command:[/] {raw_cmd} (did you mean {opts}?)")
+            else:
+                self.console.print(f"[{self.theme.ui_warn}]Unknown command:[/] {raw_cmd} (try /help)")
+            return True
+
+        cmd = resolved_cmd
 
         if cmd == "/exit":
             self.console.print(f"[dim]Goodbye! {self.theme.glyph}[/dim]")
@@ -276,11 +488,13 @@ class IvyCLIApp:
             else:
                 self.llm_client.set_model(args[0])
                 self._persist_env({"DEFAULT_MODEL": self.llm_client.model})
+                await self._refresh_session_metadata()
                 self.console.print(f"Switched model to: [{self.theme.ui_ok}]{self.llm_client.model}[/]")
             return True
 
         if cmd == "/clear":
             await self.memory_store.clear_session(self.session_id)
+            await self._refresh_session_metadata()
             self.console.print(
                 f"Cleared history for session [{self.theme.ui_label}]{self.session_id}[/]."
             )
@@ -289,14 +503,12 @@ class IvyCLIApp:
         if cmd == "/session":
             if not args or args[0].lower() == "list":
                 sessions = await self.memory_store.list_sessions()
+                self._cached_sessions = sessions
                 render_sessions_table(
                     self.console, sessions, self.session_id, theme=self.theme
                 )
             else:
-                self.session_id = args[0]
-                self.console.print(
-                    f"Switched session to: [{self.theme.ui_label}]{self.session_id}[/]"
-                )
+                await self._switch_session(args[0])
             return True
 
         if cmd == "/new":
@@ -305,9 +517,234 @@ class IvyCLIApp:
                 self.session_id = name if ":" in name else f"cli:{name}"
             else:
                 self.session_id = f"cli:{uuid4().hex[:8]}"
+            self._session_title = None
+            await self._refresh_session_metadata()
             self.console.print(
                 f"Started new session: [{self.theme.ui_label}]{self.session_id}[/]"
             )
+            return True
+
+        if cmd == "/fork":
+            dst_name = args[0].strip() if args else f"cli:{uuid4().hex[:8]}"
+            if ":" not in dst_name:
+                dst_name = f"cli:{dst_name}"
+            copied = await self.memory_store.fork_session(self.session_id, dst_name)
+            self.session_id = dst_name
+            await self._refresh_session_metadata()
+            self.console.print(
+                f"[{self.theme.ui_ok}]Forked session →[/] [{self.theme.ui_label}]{self.session_id}[/] "
+                f"[dim]({copied} messages copied)[/dim]"
+            )
+            return True
+
+        if cmd == "/title":
+            if not args:
+                cur = await self.memory_store.get_session_title(self.session_id)
+                self.console.print(
+                    f"Session [{self.theme.ui_label}]{self.session_id}[/] title: "
+                    + (f"[bold]{cur}[/bold]" if cur else "[dim](untitled)[/dim]")
+                )
+            else:
+                new_title = " ".join(args).strip()
+                await self.memory_store.set_session_title(self.session_id, new_title)
+                self._session_title = new_title
+                self.console.print(f"Updated session title: [bold {self.theme.ui_label}]{new_title}[/]")
+            return True
+
+        if cmd == "/undo":
+            undone_prompt, deleted = await self.memory_store.delete_last_turn(self.session_id)
+            if deleted == 0:
+                self.console.print(f"[{self.theme.ui_warn}]Nothing to undo in this session.[/]")
+            else:
+                await self._refresh_session_metadata()
+                preview = (undone_prompt or "").strip().replace("\n", " ")[:60]
+                self.console.print(
+                    f"[{self.theme.ui_ok}]Undid last turn[/] (removed {deleted} messages: [dim]{preview}[/dim])"
+                )
+            return True
+
+        if cmd == "/retry":
+            undone_prompt, deleted = await self.memory_store.delete_last_turn(self.session_id)
+            if not undone_prompt:
+                self.console.print(f"[{self.theme.ui_warn}]No previous user prompt to retry.[/]")
+                return True
+            self.console.print(f"[dim]Retrying prompt ({deleted} msgs rolled back)...[/dim]")
+            await self._run_turn_with_live_stream(undone_prompt)
+            return True
+
+        if cmd == "/history":
+            limit = int(args[0]) if args and args[0].isdigit() else 20
+            messages = await self.memory_store.get_messages(self.session_id, limit=max(1, limit))
+            render_history_view(self.console, messages, limit=limit, theme=self.theme)
+            return True
+
+        if cmd == "/save":
+            raw_arg_str = raw_line.strip()[len(parts[0]):].strip()
+            fmt = "md"
+            out_path: str | None = None
+            if raw_arg_str:
+                first_tok, *rest_toks = raw_arg_str.split(maxsplit=1)
+                if first_tok.lower() in ("md", "markdown", "json"):
+                    fmt = "json" if first_tok.lower() == "json" else "md"
+                    out_path = rest_toks[0].strip().strip("\"'") if rest_toks else None
+                else:
+                    out_path = raw_arg_str.strip("\"'")
+                    if out_path.lower().endswith(".json"):
+                        fmt = "json"
+            messages = await self.memory_store.get_messages(self.session_id, limit=1000)
+            if not out_path:
+                safe_sid = self.session_id.replace(":", "_")
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = f"ivy_{safe_sid}_{stamp}.{fmt}"
+            content = (
+                export_session_json(self.session_id, self._session_title, messages)
+                if fmt == "json"
+                else export_session_markdown(self.session_id, self._session_title, messages)
+            )
+            dest = Path(out_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+            self.console.print(f"[{self.theme.ui_ok}]Saved transcript:[/] {dest} ({len(messages)} msgs)")
+            return True
+
+        if cmd == "/copy":
+            nth = int(args[0]) if args and args[0].isdigit() and int(args[0]) >= 1 else 1
+            messages = await self.memory_store.get_messages(self.session_id, limit=200)
+            replies = [
+                m.content
+                for m in messages
+                if m.role.value == "assistant" and (m.content or "").strip()
+            ]
+            if not replies or nth > len(replies):
+                self.console.print(f"[{self.theme.ui_warn}]No matching assistant response to copy.[/]")
+                return True
+            target_text = replies[-nth] or ""
+            ok, method = copy_to_clipboard(target_text)
+            if ok:
+                self.console.print(
+                    f"[{self.theme.ui_ok}]Copied reply[/] ({len(target_text)} chars via {method})."
+                )
+            else:
+                self.console.print(f"[{self.theme.ui_error}]Clipboard copy failed:[/] {method}")
+            return True
+
+        if cmd == "/context":
+            history = await self.memory_store.get_messages(self.session_id, limit=200)
+            breakdown = compute_context_breakdown(
+                history,
+                model=self.llm_client.model,
+                tool_schemas=self._tool_schemas(),
+            )
+            self._ctx_percent = float(breakdown["percent"])
+            render_context_panel(self.console, breakdown, self.llm_client.model, theme=self.theme)
+            return True
+
+        if cmd == "/usage":
+            render_usage_table(
+                self.console,
+                self._usage_stats,
+                self.llm_client.model,
+                compressions=self._compressions,
+                theme=self.theme,
+            )
+            return True
+
+        if cmd == "/compact":
+            focus = " ".join(args).strip() or None
+            history = await self.memory_store.get_messages(self.session_id, limit=500)
+            mgr = ContextWindowManager()
+            compacted, stats = await mgr.compact_with_llm(
+                history, llm_client=self.llm_client, keep_recent=6, focus=focus
+            )
+            if stats["removed_messages"] == 0:
+                self.console.print("[dim]Session history is already compact enough.[/dim]")
+            else:
+                await self.memory_store.replace_session_messages(self.session_id, compacted)
+                self._compressions += 1
+                await self._refresh_session_metadata()
+                self.console.print(
+                    f"[{self.theme.ui_ok}]Compacted {stats['removed_messages']} messages[/] "
+                    f"(saved ~{format_token_count(stats['saved_tokens'])} tokens)"
+                )
+            return True
+
+        if cmd == "/status":
+            history = await self.memory_store.get_messages(self.session_id, limit=200)
+            breakdown = compute_context_breakdown(
+                history,
+                model=self.llm_client.model,
+                tool_schemas=self._tool_schemas(),
+            )
+            render_status_panel(
+                self.console,
+                {
+                    "session_id": self.session_id,
+                    "title": self._session_title,
+                    "model": self.llm_client.model,
+                    "provider": getattr(self.llm_client, "provider", "openai"),
+                    "cwd": os.getcwd(),
+                    "ctx_used": breakdown["used_tokens"],
+                    "ctx_max": breakdown["max_tokens"],
+                    "ctx_pct": breakdown["percent"],
+                    "message_count": len(history),
+                    "display_mode": self.display_mode,
+                    "yolo": self._is_yolo(),
+                    "total_tokens": self._usage_stats["total_tokens"],
+                    "api_calls": self._usage_stats["api_calls"],
+                },
+                theme=self.theme,
+            )
+            return True
+
+        if cmd == "/diff":
+            staged = any(a.lower() == "staged" for a in args)
+            stat = any(a.lower() == "--stat" for a in args)
+            diff_out = run_git_diff(staged=staged, stat=stat)
+            render_diff_output(self.console, diff_out, theme=self.theme)
+            return True
+
+        if cmd == "/verbose":
+            modes = ("compact", "verbose", "focus")
+            if args and args[0].lower() in modes:
+                self.display_mode = args[0].lower()
+            else:
+                idx = modes.index(self.display_mode) if self.display_mode in modes else 0
+                self.display_mode = modes[(idx + 1) % len(modes)]
+            self.console.print(f"Display mode: [bold {self.theme.ui_accent}]{self.display_mode}[/]")
+            return True
+
+        if cmd == "/focus":
+            sub = args[0].lower() if args else ("off" if self.display_mode == "focus" else "on")
+            if sub == "on":
+                self.display_mode = "focus"
+            elif sub == "off":
+                self.display_mode = "compact"
+            self.console.print(
+                f"Focus mode: [{'bold ' + self.theme.ui_accent if self.display_mode == 'focus' else 'dim'}]"
+                f"{'ON (tool lines hidden)' if self.display_mode == 'focus' else 'OFF'}[/]"
+            )
+            return True
+
+        if cmd == "/yolo":
+            if self.approval_policy is None:
+                self.console.print(f"[{self.theme.ui_warn}]No approval policy attached.[/]")
+            else:
+                self.approval_policy.auto_approve = not self.approval_policy.auto_approve
+                state = (
+                    "[bold red]ON — auto-approving dangerous commands this session[/]"
+                    if self.approval_policy.auto_approve
+                    else f"[{self.theme.ui_ok}]OFF — interactive safety guard active[/]"
+                )
+                self.console.print(f"YOLO mode: {state}")
+            return True
+
+        if cmd == "/prompt":
+            initial = " ".join(args)
+            composed = await self._compose_in_editor(initial)
+            if composed:
+                await self._run_turn_with_live_stream(composed)
+            else:
+                self.console.print("[dim]Editor buffer empty — nothing sent.[/dim]")
             return True
 
         if cmd == "/memory":
@@ -367,11 +804,27 @@ class IvyCLIApp:
             self.console.print(f"Gateway tokens — Telegram: {tg_state}, Discord: {dc_state}")
             return True
 
-        self.console.print(f"[{self.theme.ui_warn}]Unknown command:[/] {cmd} (try /help)")
         return True
 
     async def _run_turn_with_live_stream(self, prompt_text: str) -> None:
-        """Execute one turn with spinner, live Rich Markdown streaming, and Ctrl+C cancel."""
+        """Execute one turn with @mention expansion, spinner, live Markdown streaming, and footer."""
+        effective_prompt, attached = expand_at_mentions(prompt_text)
+        if attached:
+            self.console.print(f"[dim]📎 Attached: {', '.join(attached)}[/dim]")
+
+        # Auto-title new untitled sessions on the first user turn (zero LLM cost)
+        if not self._session_title:
+            auto_title = " ".join(prompt_text.strip().split())[:48]
+            if auto_title:
+                self._session_title = auto_title
+                try:
+                    await self.memory_store.set_session_title(self.session_id, auto_title)
+                except Exception:
+                    pass
+
+        t0 = time.monotonic()
+        tool_events = 0
+        hidden_tool_events = 0
         status = self.console.status(
             f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]",
             spinner="dots",
@@ -406,27 +859,68 @@ class IvyCLIApp:
                 live.update(Markdown("".join(chunks)))
 
         def _on_tool(ev: dict[str, Any]) -> None:
+            nonlocal tool_events, hidden_tool_events
+            if ev.get("phase") == "end":
+                tool_events += 1
+            if self.display_mode == "focus":
+                if ev.get("phase") == "end":
+                    hidden_tool_events += 1
+                return
+            if ev.get("phase") == "start":
+                status.update(
+                    f"[{self.theme.ui_accent}]{self.theme.glyph} Running {ev.get('name', 'tool')}...[/]"
+                )
+            elif ev.get("phase") == "end":
+                status.update(f"[{self.theme.ui_accent}]{self.theme.glyph} Thinking...[/]")
             if live is not None:
                 _stop_live()
                 chunks.clear()
                 status.start()
-            render_tool_event(self.console, ev, theme=self.theme)
+            render_tool_event(self.console, ev, theme=self.theme, display_mode=self.display_mode)
 
         try:
             with status:
                 reply = await self.agent.run_turn(
-                    prompt=prompt_text,
+                    prompt=effective_prompt,
                     session_id=self.session_id,
                     stream=True,
                     stream_callback=_on_token,
                     tool_callback=_on_tool,
                 )
+            elapsed = time.monotonic() - t0
+            self._last_duration_s = elapsed
+
+            turn_tokens = 0
+            meta = getattr(reply, "metadata", None)
+            if isinstance(meta, dict):
+                tu = meta.get("turn_usage")
+                if isinstance(tu, dict):
+                    self._usage_stats["prompt_tokens"] += int(tu.get("prompt_tokens", 0) or 0)
+                    self._usage_stats["completion_tokens"] += int(tu.get("completion_tokens", 0) or 0)
+                    self._usage_stats["total_tokens"] += int(tu.get("total_tokens", 0) or 0)
+                    self._usage_stats["api_calls"] += int(tu.get("api_calls", 0) or 0)
+                    turn_tokens = int(tu.get("total_tokens", 0) or 0)
+
             if live is not None:
                 live.update(Markdown(reply.content or "".join(chunks)))
                 _stop_live()
                 self.console.print(rule)
             else:
                 render_assistant_reply(self.console, reply.content or "", theme=self.theme)
+
+            if hidden_tool_events > 0:
+                self.console.print(
+                    f"[dim]⋯ {hidden_tool_events} tool call{'s' if hidden_tool_events != 1 else ''} hidden (/focus off to show)[/dim]"
+                )
+            render_turn_footer(
+                self.console,
+                duration_s=elapsed,
+                tool_count=tool_events,
+                tokens=turn_tokens,
+                timestamp_str=datetime.now().strftime("%H:%M"),
+                theme=self.theme,
+            )
+            await self._refresh_session_metadata()
         except (asyncio.CancelledError, KeyboardInterrupt):
             _stop_live()
             self.console.print(f"[{self.theme.ui_warn}]Turn cancelled.[/]")
@@ -439,6 +933,7 @@ class IvyCLIApp:
 
     async def run_interactive(self) -> None:
         """Start interactive prompt_toolkit REPL with Hermes-inspired chrome."""
+        await self._refresh_session_metadata()
         render_banner(
             self.console,
             model=self.llm_client.model,
@@ -446,11 +941,19 @@ class IvyCLIApp:
             tool_names=self._tool_names(),
             skills=self.skill_engine.list_skills(),
             theme=self.theme,
+            session_title=self._session_title,
+            git_branch=self._git_branch,
         )
+        existing = await self.memory_store.get_messages(self.session_id, limit=50)
+        if existing:
+            render_session_recap(
+                self.console, self.session_id, self._session_title, existing, theme=self.theme
+            )
         prompt_session = create_prompt_session(
             theme=self.theme,
             bottom_toolbar=self._render_toolbar,
             skill_engine=self.skill_engine,
+            history_path=self.history_path,
         )
         self._prompt_session = prompt_session
 
@@ -463,8 +966,19 @@ class IvyCLIApp:
                 self.console.print(f"\n[dim]Exiting Ivy. {self.theme.glyph}[/dim]")
                 break
 
+            if user_input.startswith("__IVY_EDITOR__:"):
+                draft = user_input[len("__IVY_EDITOR__:"):]
+                composed = await self._compose_in_editor(draft)
+                if not composed:
+                    continue
+                user_input = composed
+
             text = user_input.strip()
             if not text:
+                continue
+
+            if text.startswith("!"):
+                await self._run_bang_command(text[1:].strip())
                 continue
 
             if text.startswith("/"):
@@ -583,6 +1097,12 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_generator=skill_gen,
             config=config,
         )
+        target_session = args.session
+        if getattr(args, "continue_latest", False) and target_session == "cli:main":
+            latest = await store.get_latest_session_id()
+            if latest:
+                target_session = latest
+
         app = IvyCLIApp(
             config=config,
             llm_client=llm,
@@ -590,10 +1110,12 @@ async def _run_async(args: argparse.Namespace) -> int:
             skill_engine=skills,
             agent=agent,
             skill_generator=skill_gen,
-            session_id=args.session,
+            session_id=target_session,
             console=console,
             theme_name=args.theme or config.default_theme,
             env_path=".env",
+            approval_policy=cli_policy,
+            history_path=Path.home() / ".ivy" / "history",
         )
         cli_policy.approval_callback = app._interactive_approval
         if args.command == "cron":

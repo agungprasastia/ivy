@@ -239,3 +239,45 @@ async def test_code_runner_cleanup_on_cancel():
 
     assert len(procs) == 1
     assert procs[0].returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_file_tools_emit_diff_metadata_and_approval_session_feedback(tmp_path):
+    from ivy.tools.files import PatchFileTool, WriteFileTool
+
+    target_file = tmp_path / "app.py"
+    writer = WriteFileTool()
+    r1 = await writer.execute(path=str(target_file), content="x = 1\ny = 2\n")
+    assert r1.status == "success"
+    assert r1.metadata["added"] == 2
+    assert "+x = 1" in r1.metadata["diff"]
+
+    patcher = PatchFileTool()
+    r2 = await patcher.execute(path=str(target_file), target="y = 2", replacement="y = 42\nz = 99")
+    assert r2.status == "success"
+    assert r2.metadata["added"] == 2
+    assert r2.metadata["removed"] == 1
+    assert "-y = 2" in r2.metadata["diff"]
+    assert "+y = 42" in r2.metadata["diff"]
+
+    # Session allow & deny-with-feedback
+    calls = []
+
+    def cb(cmd: str):
+        calls.append(cmd)
+        if "once-session" in cmd:
+            return "session"
+        return (False, "Use pytest instead of rm")
+
+    policy = SafetyApprovalPolicy(auto_approve=False, approval_callback=cb)
+    ok1, fb1 = await policy.evaluate_approval("rm -rf once-session")
+    assert ok1 is True and fb1 is None
+    # Second identical command uses session allowlist without invoking callback again
+    ok2, fb2 = await policy.evaluate_approval("rm -rf once-session")
+    assert ok2 is True and fb2 is None
+    assert len(calls) == 1
+
+    term = TerminalTool(approval_policy=policy)
+    res_rej = await term.execute(command="rm -rf /tmp/danger")
+    assert res_rej.status == "rejected"
+    assert "Use pytest instead of rm" in (res_rej.error or "")

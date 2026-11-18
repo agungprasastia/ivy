@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
@@ -116,6 +117,8 @@ class IvyAgent:
         schemas = self.tool_registry.get_schemas() or None
         used_tools = False
         user_persisted = False
+        turn_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "api_calls": 0}
+        tool_calls_count = 0
 
         for _ in range(self.max_iterations):
             did_stream = False
@@ -136,6 +139,13 @@ class IvyAgent:
                     text = "".join([chunk async for chunk in reply])
                     reply = ChatMessage(role=Role.ASSISTANT, content=text)
 
+            turn_usage["api_calls"] += 1
+            msg_usage = reply.metadata.get("usage") if isinstance(reply.metadata, dict) else None
+            if isinstance(msg_usage, dict):
+                turn_usage["prompt_tokens"] += int(msg_usage.get("prompt_tokens", 0) or 0)
+                turn_usage["completion_tokens"] += int(msg_usage.get("completion_tokens", 0) or 0)
+                turn_usage["total_tokens"] += int(msg_usage.get("total_tokens", 0) or 0)
+
             if not user_persisted:
                 await self._persist_message(session_id, user_msg, platform=platform)
                 user_persisted = True
@@ -148,6 +158,10 @@ class IvyAgent:
                         await self.skill_generator.reflect_and_create(messages)
                     except Exception:
                         pass
+                reply.metadata = dict(reply.metadata or {})
+                reply.metadata["turn_usage"] = turn_usage
+                reply.metadata["tool_calls_count"] = tool_calls_count
+                reply.metadata["context_messages"] = len(messages)
                 if reply.content and not did_stream:
                     await self._emit(stream_callback, reply.content)
                 return reply
@@ -155,23 +169,29 @@ class IvyAgent:
             used_tools = True
 
             for tc in reply.tool_calls:
+                tool_calls_count += 1
                 await self._emit(
                     tool_callback,
                     {"phase": "start", "name": tc.function_name, "arguments": tc.arguments},
                 )
+                t0 = time.monotonic()
                 result = await self.tool_registry.execute(
                     tool_name=tc.function_name,
                     arguments=tc.arguments,
                     tool_call_id=tc.id,
                 )
+                elapsed_s = round(time.monotonic() - t0, 3)
                 await self._emit(
                     tool_callback,
                     {
                         "phase": "end",
                         "name": tc.function_name,
+                        "arguments": tc.arguments,
                         "status": result.status,
                         "output": result.output,
                         "error": result.error,
+                        "duration_s": elapsed_s,
+                        "metadata": result.metadata,
                     },
                 )
 

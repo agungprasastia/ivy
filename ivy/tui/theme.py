@@ -44,6 +44,12 @@ class ThemeConfig:
     status_bar_dim: str
     completion_bg: str
     completion_current_bg: str
+    diff_add: str = "#4ADE80"
+    diff_del: str = "#F87171"
+    ctx_ok: str = "#4ADE80"
+    ctx_warn: str = "#FBBF24"
+    ctx_high: str = "#FB923C"
+    ctx_crit: str = "#F87171"
 
 
 THEMES: dict[str, ThemeConfig] = {

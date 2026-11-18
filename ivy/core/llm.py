@@ -13,6 +13,32 @@ from openai import AsyncOpenAI
 from ivy.config import IvyConfig, load_config
 from ivy.core.types import ChatMessage, Role, ToolCall
 
+def _extract_usage_dict(usage_obj: Any) -> dict[str, int] | None:
+    """Normalize OpenAI/Anthropic usage objects or dicts into {prompt_tokens, completion_tokens, total_tokens}."""
+    if usage_obj is None:
+        return None
+    if isinstance(usage_obj, dict):
+        prompt = usage_obj.get("prompt_tokens") or usage_obj.get("input_tokens") or 0
+        completion = usage_obj.get("completion_tokens") or usage_obj.get("output_tokens") or 0
+        total = usage_obj.get("total_tokens") or (int(prompt) + int(completion))
+    else:
+        prompt = getattr(usage_obj, "prompt_tokens", None)
+        if prompt is None:
+            prompt = getattr(usage_obj, "input_tokens", 0) or 0
+        completion = getattr(usage_obj, "completion_tokens", None)
+        if completion is None:
+            completion = getattr(usage_obj, "output_tokens", 0) or 0
+        total = getattr(usage_obj, "total_tokens", None) or (int(prompt) + int(completion))
+    prompt_i, completion_i, total_i = int(prompt or 0), int(completion or 0), int(total or 0)
+    if prompt_i == 0 and completion_i == 0 and total_i == 0:
+        return None
+    return {
+        "prompt_tokens": prompt_i,
+        "completion_tokens": completion_i,
+        "total_tokens": total_i,
+    }
+
+
 _PROVIDER_BASE_URLS: dict[str, str] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -295,9 +321,19 @@ class LLMClient:
             resp = await client.messages.create(**params)
             text_parts: list[str] = []
             tool_blocks: dict[int, dict[str, Any]] = {}
+            usage_stats: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             async for event in resp:
                 etype = getattr(event, "type", None)
-                if etype == "content_block_start":
+                if etype == "message_start":
+                    msg_obj = getattr(event, "message", None)
+                    u = _extract_usage_dict(getattr(msg_obj, "usage", None))
+                    if u:
+                        usage_stats["prompt_tokens"] += u["prompt_tokens"]
+                elif etype == "message_delta":
+                    u = _extract_usage_dict(getattr(event, "usage", None))
+                    if u:
+                        usage_stats["completion_tokens"] += u["completion_tokens"]
+                elif etype == "content_block_start":
                     idx = getattr(event, "index", 0)
                     blk = getattr(event, "content_block", None)
                     if getattr(blk, "type", None) == "tool_use":
@@ -333,10 +369,13 @@ class LLMClient:
                         arguments=args_dict if isinstance(args_dict, dict) else {},
                     )
                 )
+            usage_stats["total_tokens"] = usage_stats["prompt_tokens"] + usage_stats["completion_tokens"]
+            meta = {"usage": usage_stats} if usage_stats["total_tokens"] > 0 else {}
             return ChatMessage(
                 role=Role.ASSISTANT,
                 content="".join(text_parts),
                 tool_calls=parsed_calls or None,
+                metadata=meta,
             )
 
         formatted_messages = self._format_openai_messages(messages)
@@ -344,6 +383,7 @@ class LLMClient:
             "model": self.resolved_model,
             "messages": formatted_messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             **kwargs,
         }
         if temperature is not None:
@@ -353,11 +393,23 @@ class LLMClient:
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
 
         client = self._get_openai_client()
-        resp = await client.chat.completions.create(**params)
+        try:
+            resp = await client.chat.completions.create(**params)
+        except Exception as exc:
+            # Some OpenAI-compatible proxies reject stream_options; fall back cleanly.
+            if "stream_options" in params and ("stream_options" in str(exc).lower() or isinstance(exc, TypeError)):
+                params.pop("stream_options", None)
+                resp = await client.chat.completions.create(**params)
+            else:
+                raise
         text_parts = []
         tc_acc: dict[int, dict[str, str]] = {}
+        stream_usage: dict[str, int] | None = None
 
         async for chunk in resp:
+            chunk_usage = _extract_usage_dict(getattr(chunk, "usage", None))
+            if chunk_usage:
+                stream_usage = chunk_usage
             choices = getattr(chunk, "choices", None)
             if not choices:
                 continue
@@ -395,10 +447,12 @@ class LLMClient:
                     arguments=args_dict if isinstance(args_dict, dict) else {},
                 )
             )
+        meta = {"usage": stream_usage} if stream_usage else {}
         return ChatMessage(
             role=Role.ASSISTANT,
             content="".join(text_parts),
             tool_calls=parsed_calls or None,
+            metadata=meta,
         )
 
     async def _stream_openai(
@@ -526,10 +580,16 @@ class LLMClient:
                     )
                 )
 
+        usage = _extract_usage_dict(
+            getattr(response, "usage", None)
+            or (response.get("usage") if isinstance(response, dict) else None)
+        )
+        meta = {"usage": usage} if usage else {}
         return ChatMessage(
             role=Role.ASSISTANT,
             content=content or "",
             tool_calls=parsed_tool_calls if parsed_tool_calls else None,
+            metadata=meta,
         )
 
     def _parse_anthropic_response(self, response: Any) -> ChatMessage:
@@ -569,8 +629,14 @@ class LLMClient:
                     )
                 )
 
+        usage = _extract_usage_dict(
+            getattr(response, "usage", None)
+            or (response.get("usage") if isinstance(response, dict) else None)
+        )
+        meta = {"usage": usage} if usage else {}
         return ChatMessage(
             role=Role.ASSISTANT,
             content="\n".join(text_parts),
             tool_calls=tool_calls if tool_calls else None,
+            metadata=meta,
         )

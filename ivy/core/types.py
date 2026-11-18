@@ -52,6 +52,7 @@ class ToolResult(BaseModel):
     status: str = "success"  # "success", "rejected", "error"
     output: str = ""
     error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatMessage(BaseModel):

@@ -405,3 +405,149 @@ async def test_session_and_new_slash_commands(tmp_path):
     assert app.session_id.startswith("cli:")
 
     await store.close()
+
+
+def test_hermes_ux_helpers_completion_toolbar_and_parser(tmp_path):
+    from prompt_toolkit.completion import CompleteEvent
+    from prompt_toolkit.document import Document
+    from ivy.tui.helpers import expand_at_mentions, resolve_slash_command
+    from ivy.tui.prompt import SLASH_COMMANDS, build_bottom_toolbar
+
+    # Exact, alias, unique prefix, ambiguous prefix, typo
+    assert resolve_slash_command("/compress", SLASH_COMMANDS)[0] == "/compact"
+    assert resolve_slash_command("/branch", SLASH_COMMANDS)[0] == "/fork"
+    assert resolve_slash_command("/compa", SLASH_COMMANDS)[:3:2] == ("/compact", "prefix")
+    cmd, cands, mode = resolve_slash_command("/s", SLASH_COMMANDS)
+    assert cmd is None and mode == "ambiguous" and "/session" in cands
+    cmd2, sugg, mode2 = resolve_slash_command("/modle", SLASH_COMMANDS)
+    assert cmd2 is None and mode2 == "unknown" and "/model" in sugg
+
+    # @file mention completion & expansion
+    sample = tmp_path / "hello.py"
+    sample.write_text("print('ivy')\n", encoding="utf-8")
+    completer = build_slash_completer(cwd=str(tmp_path))
+    items = [
+        c.text for c in completer.get_completions(Document("check @hel", cursor_position=10), CompleteEvent())
+    ]
+    assert "@hello.py" in items
+
+    augmented, attached = expand_at_mentions("inspect @hello.py", cwd=str(tmp_path))
+    assert "@hello.py (2L)" in attached
+    assert "print('ivy')" in augmented
+
+    # Rich toolbar context bar, YOLO & FOCUS badges, width shedding
+    toolbar = build_bottom_toolbar(
+        model="gpt-4o-mini",
+        session_id="cli:main",
+        ctx_percent=45.0,
+        total_tokens=2500,
+        last_duration_s=1.4,
+        yolo=True,
+        focus_mode=True,
+        session_title="Refactor UX",
+        git_branch="master",
+        width=120,
+    )
+    rendered = "".join(txt for _, txt in toolbar)
+    assert "45%" in rendered
+    assert "2.5k tok" in rendered
+    assert "YOLO" in rendered
+    assert "FOCUS" in rendered
+    assert "Refactor UX" in rendered
+
+    # -c / --continue parser flag
+    args = build_parser().parse_args(["-c"])
+    assert args.continue_latest is True
+
+
+@pytest.mark.asyncio
+async def test_hermes_ux_slash_commands_bang_and_approval_flow(tmp_path):
+    from io import StringIO
+    from unittest.mock import patch
+    from rich.console import Console
+    from ivy.tools.approval import SafetyApprovalPolicy
+
+    cfg = IvyConfig(db_path=str(tmp_path / "ux_cli.db"), skills_dir=str(tmp_path / "skills"))
+    store = MemoryStore(db_path=cfg.db_path)
+    await store.initialize()
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="hello ivy"))
+    await store.save_message("cli:main", ChatMessage(role=Role.ASSISTANT, content="hi from ivy!"))
+
+    skills = SkillEngine(skills_dir=cfg.skills_dir)
+    llm = LLMClient(cfg)
+    mock_agent = MagicMock()
+    mock_agent.run_turn = AsyncMock(
+        return_value=ChatMessage(
+            role=Role.ASSISTANT,
+            content="retried ok",
+            metadata={"turn_usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "api_calls": 1}},
+        )
+    )
+    policy = SafetyApprovalPolicy(auto_approve=False)
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=110)
+    app = IvyCLIApp(
+        config=cfg,
+        llm_client=llm,
+        memory_store=store,
+        skill_engine=skills,
+        agent=mock_agent,
+        console=console,
+        approval_policy=policy,
+    )
+
+    # /title, /status, /context, /usage, /history, /verbose, /focus, /yolo
+    assert await app.handle_slash_command("/title UX Upgrade") is True
+    assert await app.handle_slash_command("/status") is True
+    assert await app.handle_slash_command("/context") is True
+    assert await app.handle_slash_command("/usage") is True
+    assert await app.handle_slash_command("/history 10") is True
+    assert await app.handle_slash_command("/verbose verbose") is True
+    assert app.display_mode == "verbose"
+    assert await app.handle_slash_command("/focus on") is True
+    assert app.display_mode == "focus"
+    assert await app.handle_slash_command("/yolo") is True
+    assert policy.auto_approve is True
+    assert await app.handle_slash_command("/yolo") is True
+    assert policy.auto_approve is False
+
+    # /save md & /save json
+    md_out = tmp_path / "out.md"
+    json_out = tmp_path / "out.json"
+    assert await app.handle_slash_command(f"/save md {md_out}") is True
+    assert await app.handle_slash_command(f"/save json {json_out}") is True
+    assert "hi from ivy!" in md_out.read_text(encoding="utf-8")
+    assert '"session_id": "cli:main"' in json_out.read_text(encoding="utf-8")
+
+    # /copy
+    with patch("ivy.tui.app.copy_to_clipboard", return_value=(True, "mock")) as mock_clip:
+        assert await app.handle_slash_command("/copy") is True
+        mock_clip.assert_called_once_with("hi from ivy!")
+
+    # /fork + /undo + /retry + /compact
+    assert await app.handle_slash_command("/fork exp") is True
+    assert app.session_id == "cli:exp"
+    assert await app.handle_slash_command("/retry") is True
+    mock_agent.run_turn.assert_awaited()
+    assert await app.handle_slash_command("/undo") is True
+    assert await app.handle_slash_command("/compact") is True
+
+    # Typo suggestion
+    assert await app.handle_slash_command("/modle") is True
+    assert "did you mean /model" in buf.getvalue()
+
+    # Bang shell escape (0 tokens, skips agent)
+    calls_before = mock_agent.run_turn.await_count
+    await app._run_bang_command("echo bang_ok")
+    assert "bang_ok" in buf.getvalue()
+    assert mock_agent.run_turn.await_count == calls_before
+
+    # Rich _interactive_approval [s] and [t]
+    with patch("builtins.input", return_value="s"):
+        assert await app._interactive_approval("rm -rf x") == "session"
+    inputs = iter(["t", "use python pathlib instead"])
+    with patch("builtins.input", side_effect=lambda *_: next(inputs)):
+        assert await app._interactive_approval("rm -rf y") == (False, "use python pathlib instead")
+
+    await store.close()

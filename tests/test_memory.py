@@ -97,3 +97,56 @@ async def test_memory_store_list_sessions(tmp_path):
     assert "cli:work" in by_id
     assert by_id["cli:work"]["message_count"] == 2
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_store_title_undo_fork_and_context_compaction(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+    from ivy.memory.context import ContextWindowManager, compute_context_breakdown
+
+    store = MemoryStore(db_path=str(tmp_path / "ux_mem.db"))
+    await store.initialize()
+
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="first q"))
+    await store.save_message("cli:main", ChatMessage(role=Role.ASSISTANT, content="first a"))
+    await store.save_message("cli:main", ChatMessage(role=Role.USER, content="second q"))
+    await store.save_message("cli:main", ChatMessage(role=Role.ASSISTANT, content="second a"))
+    await store.set_session_title("cli:main", "Bugfix Auth")
+
+    assert await store.get_session_title("cli:main") == "Bugfix Auth"
+    assert await store.get_latest_session_id() == "cli:main"
+
+    sessions = await store.list_sessions()
+    assert sessions[0]["title"] == "Bugfix Auth"
+
+    # Fork before undo
+    copied = await store.fork_session("cli:main", "cli:branch1")
+    assert copied == 4
+    assert len(await store.get_messages("cli:branch1")) == 4
+
+    # Undo removes last turn (second q + second a)
+    undone_prompt, deleted = await store.delete_last_turn("cli:main")
+    assert undone_prompt == "second q"
+    assert deleted == 2
+    remaining = await store.get_messages("cli:main")
+    assert len(remaining) == 2
+
+    # Context breakdown & LLM compaction
+    breakdown = compute_context_breakdown(remaining, model="gpt-4o-mini")
+    assert breakdown["used_tokens"] > 0
+    assert breakdown["max_tokens"] == 128_000
+    assert 0.0 <= breakdown["percent"] <= 100.0
+
+    mock_llm = MagicMock()
+    mock_llm.chat_completion = AsyncMock(
+        return_value=ChatMessage(role=Role.ASSISTANT, content="- Summary of earlier turns")
+    )
+    long_msgs = [ChatMessage(role=Role.USER, content=f"Turn {i} details " * 8) for i in range(10)]
+    compacted, stats = await ContextWindowManager().compact_with_llm(
+        long_msgs, llm_client=mock_llm, keep_recent=4
+    )
+    assert len(compacted) == 5
+    assert stats["removed_messages"] == 6
+    assert "Summary of earlier turns" in (compacted[0].content or "")
+
+    await store.close()

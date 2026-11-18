@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from pathlib import Path
@@ -12,6 +13,30 @@ from ivy.tools.base import BaseTool
 
 if TYPE_CHECKING:
     from ivy.tools.registry import ToolRegistry
+
+
+def _build_diff_metadata(path_label: str, before: str, after: str) -> dict[str, Any]:
+    """Compute bounded unified diff stats for file-editing tool results."""
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    diff_lines = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{path_label}",
+            tofile=f"b/{path_label}",
+            n=2,
+        )
+    )
+    added = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+    diff_text = "".join(diff_lines[:120])
+    return {
+        "path": path_label,
+        "diff": diff_text,
+        "added": added,
+        "removed": removed,
+    }
 
 
 class ReadFileTool(BaseTool):
@@ -98,6 +123,12 @@ class WriteFileTool(BaseTool):
     ) -> ToolResult:
         file_path = Path(path).resolve()
         try:
+            before_text = ""
+            if file_path.exists() and file_path.is_file():
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    before_text = f.read()
+            after_text = (before_text + content) if append else content
+
             file_path.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if append else "w"
             with open(file_path, mode, encoding="utf-8") as f:
@@ -107,6 +138,7 @@ class WriteFileTool(BaseTool):
                 tool_name=self.name,
                 status="success",
                 output=f"Successfully wrote {len(content)} characters to {path}",
+                metadata=_build_diff_metadata(path, before_text, after_text),
             )
         except Exception as exc:
             return ToolResult(
@@ -214,6 +246,7 @@ class PatchFileTool(BaseTool):
                 tool_name=self.name,
                 status="success",
                 output=f"Successfully patched {path}",
+                metadata=_build_diff_metadata(path, content, updated),
             )
         except Exception as exc:
             return ToolResult(

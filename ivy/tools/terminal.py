@@ -51,13 +51,18 @@ class TerminalTool(BaseTool):
         **kwargs: Any,
     ) -> ToolResult:
         """Run the command after safety approval."""
-        is_approved = await self.approval_policy.check_approval(command)
+        is_approved, feedback = await self.approval_policy.evaluate_approval(command)
         if not is_approved:
+            reason = (
+                f"Command rejected by user. User instruction: {feedback}"
+                if feedback
+                else "Command rejected by safety approval policy"
+            )
             return ToolResult(
                 tool_name=self.name,
                 status="rejected",
-                error="Command rejected by safety approval policy",
-                output="Command execution rejected by user/safety policy",
+                error=reason,
+                output=reason if feedback else "Command execution rejected by user/safety policy",
             )
 
         if platform.system() == "Windows":

@@ -427,3 +427,91 @@ async def test_llm_client_does_not_retry_auth_error_or_mid_stream_failure(monkey
     assert seen == ["half "]
     assert mock_openai.chat.completions.create.await_count == 1
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_retries_overloaded_529(monkeypatch):
+    class OverloadedError(Exception):
+        status_code = 529
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        default_model="gpt-4o-mini",
+        llm_max_retries=1,
+        llm_retry_base_delay=0.01,
+    )
+    client = LLMClient(config=cfg)
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(
+        side_effect=[
+            OverloadedError("overloaded"),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="Ok 529", tool_calls=None))],
+                usage=None,
+            ),
+        ]
+    )
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+
+    reply = await client.chat_completion([ChatMessage(role=Role.USER, content="hi")])
+    assert reply.content == "Ok 529"
+    assert mock_openai.chat.completions.create.await_count == 2
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_fallback_does_not_mutate_shared_model_under_concurrency(monkeypatch):
+    import asyncio
+
+    class ServerErr(Exception):
+        status_code = 503
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    cfg = IvyConfig(
+        openai_api_key="test-key",
+        anthropic_api_key="test-ant",
+        default_model="gpt-4o-mini",
+        fallback_model="anthropic/claude-sonnet-4-5",
+        llm_max_retries=0,
+    )
+    client = LLMClient(config=cfg)
+
+    seen_openai_models = []
+    fallback_entered = asyncio.Event()
+    release_fallback = asyncio.Event()
+
+    async def fake_openai_create(**params):
+        seen_openai_models.append(params["model"])
+        if params.get("messages") and params["messages"][-1]["content"] == "trigger-fallback":
+            raise ServerErr("primary down for task A")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Primary OK", tool_calls=None))],
+            usage=None,
+        )
+
+    async def fake_anthropic(**kwargs):
+        fallback_entered.set()
+        await release_fallback.wait()
+        return ChatMessage(role=Role.ASSISTANT, content="Fallback OK")
+
+    mock_openai = MagicMock()
+    mock_openai.chat.completions.create = AsyncMock(side_effect=fake_openai_create)
+    monkeypatch.setattr(client, "_get_openai_client", lambda: mock_openai)
+    monkeypatch.setattr(client, "_anthropic_completion", fake_anthropic)
+
+    task_a = asyncio.create_task(
+        client.chat_completion([ChatMessage(role=Role.USER, content="trigger-fallback")])
+    )
+    await fallback_entered.wait()
+    # While task_a is suspended in Anthropic fallback, shared client.model must remain primary
+    assert client.model == "gpt-4o-mini"
+    assert client.provider == "openai"
+    reply_b = await client.chat_completion([ChatMessage(role=Role.USER, content="normal")])
+    release_fallback.set()
+    reply_a = await task_a
+
+    assert reply_a.content == "Fallback OK"
+    assert reply_b.content == "Primary OK"
+    assert seen_openai_models == ["gpt-4o-mini", "gpt-4o-mini"]
+    await client.close()

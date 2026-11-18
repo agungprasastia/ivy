@@ -166,10 +166,9 @@ class BackgroundProcessManager:
         if bp is None:
             return False, f"Process '{process_id}' not found."
         status = self._refresh_status(bp)
-        combined = "".join(bp.output_chunks)
-        if tail_chars > 0 and len(combined) > tail_chars:
-            combined = combined[-tail_chars:]
-        scrubbed = redact_secrets(combined).strip()
+        scrubbed = redact_secrets("".join(bp.output_chunks)).strip()
+        if tail_chars > 0 and len(scrubbed) > tail_chars:
+            scrubbed = scrubbed[-tail_chars:]
         header = f"[{bp.process_id} pid={bp.pid} status={status}"
         if bp.exit_code is not None:
             header += f" exit={bp.exit_code}"

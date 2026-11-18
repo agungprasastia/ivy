@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -17,14 +18,15 @@ from ivy.core.types import ChatMessage, Role, ToolCall
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 529}
+_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422, 501, 505}
 _RETRYABLE_CLASS_NAMES = {
     "RateLimitError",
     "APITimeoutError",
     "APIConnectionError",
     "InternalServerError",
     "ServiceUnavailableError",
+    "OverloadedError",
 }
 
 
@@ -36,7 +38,7 @@ def _is_retryable_error(exc: Exception) -> bool:
     if isinstance(status, int):
         if status in _NON_RETRYABLE_STATUS_CODES:
             return False
-        if status in _RETRYABLE_STATUS_CODES:
+        if status in _RETRYABLE_STATUS_CODES or 500 <= status < 600:
             return True
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
         return True
@@ -91,6 +93,18 @@ class LLMClient:
         )
         self._openai_clients: dict[tuple[str, str | None], AsyncOpenAI] = {}
         self._anthropic_clients: dict[tuple[str, str | None], AsyncAnthropic] = {}
+        self._route_override: contextvars.ContextVar[
+            tuple[str, str, str, str | None] | None
+        ] = contextvars.ContextVar(f"ivy_llm_route_{id(self)}", default=None)
+
+    def _active_route(self) -> tuple[str, str, str, str | None]:
+        """Return task-local (model, provider, resolved_model, base_url) without mutating shared state."""
+        return self._route_override.get() or (
+            self.model,
+            self.provider,
+            self.resolved_model,
+            self.base_url,
+        )
 
     def set_model(self, model: str) -> None:
         """Switch active model and recompute provider routing."""
@@ -145,25 +159,27 @@ class LLMClient:
         return key_map.get(provider) or os.getenv("OPENAI_API_KEY") or "missing-api-key"
 
     def _get_openai_client(self) -> AsyncOpenAI:
-        api_key = self._resolve_api_key(self.provider)
-        cache_key = (api_key, self.base_url)
+        _, active_provider, _, active_base = self._active_route()
+        api_key = self._resolve_api_key(active_provider)
+        cache_key = (api_key, active_base)
         client = self._openai_clients.get(cache_key)
         if client is None:
             kwargs: dict[str, Any] = {"api_key": api_key}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
+            if active_base:
+                kwargs["base_url"] = active_base
             client = AsyncOpenAI(**kwargs)
             self._openai_clients[cache_key] = client
         return client
 
     def _get_anthropic_client(self) -> AsyncAnthropic:
+        _, _, _, active_base = self._active_route()
         api_key = self._resolve_api_key("anthropic")
-        cache_key = (api_key, self.base_url)
+        cache_key = (api_key, active_base)
         client = self._anthropic_clients.get(cache_key)
         if client is None:
             kwargs: dict[str, Any] = {"api_key": api_key}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
+            if active_base:
+                kwargs["base_url"] = active_base
             client = AsyncAnthropic(**kwargs)
             self._anthropic_clients[cache_key] = client
         return client
@@ -283,7 +299,7 @@ class LLMClient:
         """Run an async LLM operation with exponential backoff retries and optional fallback model."""
         max_retries = max(0, int(getattr(self.config, "llm_max_retries", 2)))
         base_delay = max(0.0, float(getattr(self.config, "llm_retry_base_delay", 0.5)))
-        primary_model = self.model
+        primary_model, _, _, _ = self._active_route()
 
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -298,7 +314,7 @@ class LLMClient:
                     delay = base_delay * (2**attempt)
                     logger.warning(
                         "Transient LLM error on %s (attempt %d/%d): %s; retrying in %.2fs",
-                        self.model,
+                        primary_model,
                         attempt + 1,
                         max_retries + 1,
                         exc,
@@ -310,11 +326,11 @@ class LLMClient:
         fallback = (getattr(self.config, "fallback_model", None) or "").strip()
         if fallback and fallback != primary_model and (can_retry is None or can_retry()):
             logger.warning("Primary model %s exhausted retries; falling back to %s", primary_model, fallback)
+            token = self._route_override.set((fallback, *self._resolve_provider(fallback)))
             try:
-                self.set_model(fallback)
                 reply = await operation()
             finally:
-                self.set_model(primary_model)
+                self._route_override.reset(token)
             reply.metadata = dict(reply.metadata or {})
             reply.metadata["fallback_used"] = True
             reply.metadata["model_used"] = fallback
@@ -333,7 +349,8 @@ class LLMClient:
     ) -> ChatMessage | AsyncIterator[str]:
         """Execute a chat completion request across OpenAI-compatible or Anthropic providers."""
         if stream:
-            if self.provider == "anthropic":
+            _, active_provider, active_resolved_model, _ = self._active_route()
+            if active_provider == "anthropic":
                 return await self._anthropic_completion(
                     messages=messages,
                     tools=tools,
@@ -343,7 +360,7 @@ class LLMClient:
                 )
             formatted_messages = self._format_openai_messages(messages)
             params: dict[str, Any] = {
-                "model": self.resolved_model,
+                "model": active_resolved_model,
                 "messages": formatted_messages,
                 "stream": True,
                 **kwargs,
@@ -356,7 +373,8 @@ class LLMClient:
             return self._stream_openai(self._get_openai_client(), params)
 
         async def _once() -> ChatMessage:
-            if self.provider == "anthropic":
+            _, active_provider, active_resolved_model, _ = self._active_route()
+            if active_provider == "anthropic":
                 res = await self._anthropic_completion(
                     messages=messages,
                     tools=tools,
@@ -369,7 +387,7 @@ class LLMClient:
 
             formatted_messages = self._format_openai_messages(messages)
             params: dict[str, Any] = {
-                "model": self.resolved_model,
+                "model": active_resolved_model,
                 "messages": formatted_messages,
                 "stream": False,
                 **kwargs,
@@ -410,12 +428,13 @@ class LLMClient:
 
         async def _stream_once() -> ChatMessage:
             call_kwargs = dict(kwargs)
-            if self.provider == "anthropic":
+            _, active_provider, active_resolved_model, _ = self._active_route()
+            if active_provider == "anthropic":
                 system_prompt, formatted, anthropic_tools = self._format_anthropic_payload(
                     messages, tools
                 )
                 params: dict[str, Any] = {
-                    "model": self.resolved_model,
+                    "model": active_resolved_model,
                     "messages": formatted,
                     "max_tokens": call_kwargs.pop("max_tokens", 4096),
                     "stream": True,
@@ -491,7 +510,7 @@ class LLMClient:
 
             formatted_messages = self._format_openai_messages(messages)
             params = {
-                "model": self.resolved_model,
+                "model": active_resolved_model,
                 "messages": formatted_messages,
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -598,11 +617,12 @@ class LLMClient:
         temperature: float | None,
         **kwargs: Any,
     ) -> ChatMessage | AsyncIterator[str]:
+        _, _, active_resolved_model, _ = self._active_route()
         system_prompt, formatted, anthropic_tools = self._format_anthropic_payload(
             messages, tools
         )
         params: dict[str, Any] = {
-            "model": self.resolved_model,
+            "model": active_resolved_model,
             "messages": formatted,
             "max_tokens": kwargs.pop("max_tokens", 4096),
             **kwargs,

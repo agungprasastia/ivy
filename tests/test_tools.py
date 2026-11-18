@@ -543,3 +543,27 @@ async def test_background_process_manager_and_process_tool(tmp_path):
     assert write_closed.status == "error"
 
     await mgr.shutdown_all()
+
+
+@pytest.mark.asyncio
+async def test_background_read_output_redacts_secret_across_tail_boundary(tmp_path):
+    from types import SimpleNamespace
+    from ivy.tools.process_registry import BackgroundProcess, BackgroundProcessManager
+
+    mgr = BackgroundProcessManager()
+    bp = BackgroundProcess(
+        process_id="proc_sec",
+        command="echo test",
+        working_dir=str(tmp_path),
+        pid=1234,
+        started_at="2026-11-18T00:00:00+00:00",
+        started_monotonic=0.0,
+        proc=SimpleNamespace(returncode=0),  # type: ignore[arg-type]
+    )
+    mgr._processes["proc_sec"] = bp
+    # Secret sits right across the last-22-char tail boundary: "key=sk-proj-" falls before -22!
+    mgr._append_output(bp, ("A" * 100) + " key=sk-proj-boundarysecret123456")
+
+    ok, out = mgr.read_output("proc_sec", tail_chars=22)
+    assert ok is True
+    assert "boundarysecret123456" not in out

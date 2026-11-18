@@ -91,3 +91,12 @@ def test_load_resilience_config_from_env(monkeypatch):
     assert cfg.llm_retry_base_delay == 0.25
     assert cfg.fallback_model == "anthropic/claude-sonnet-4-5"
     assert cfg.auto_compact_threshold == 0.75
+
+
+def test_load_security_config_from_env(monkeypatch):
+    monkeypatch.setenv("IVY_RESTRICT_WORKSPACE", "true")
+    monkeypatch.setenv("IVY_ALLOW_PRIVATE_URLS", "1")
+
+    cfg = load_config()
+    assert cfg.restrict_workspace is True
+    assert cfg.allow_private_urls is True

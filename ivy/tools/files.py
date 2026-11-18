@@ -10,10 +10,17 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from ivy.core.types import ToolResult
 from ivy.tools.base import BaseTool
+from ivy.tools.path_security import should_skip_sensitive_entry, validate_file_path
 
 if TYPE_CHECKING:
     from ivy.tools.checkpoint import FileCheckpointStore
     from ivy.tools.registry import ToolRegistry
+
+
+def _normalize_workspace_root(workspace_root: str | Path | None) -> Path | None:
+    if workspace_root is None:
+        return None
+    return Path(workspace_root).expanduser().resolve()
 
 
 def _build_diff_metadata(path_label: str, before: str, after: str) -> dict[str, Any]:
@@ -56,6 +63,14 @@ class ReadFileTool(BaseTool):
         "required": ["path"],
     }
 
+    def __init__(
+        self,
+        workspace_root: str | Path | None = None,
+        read_tracker: set[Path] | None = None,
+    ) -> None:
+        self.workspace_root = _normalize_workspace_root(workspace_root)
+        self.read_tracker = read_tracker
+
     async def execute(
         self,
         path: str,
@@ -63,7 +78,17 @@ class ReadFileTool(BaseTool):
         end_line: int | None = None,
         **kwargs: Any,
     ) -> ToolResult:
-        file_path = Path(path).resolve()
+        file_path, err = validate_file_path(
+            path,
+            mode="read",
+            workspace_root=self.workspace_root,
+        )
+        if err is not None or file_path is None:
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=err or f"Invalid path: {path}",
+            )
         if not file_path.exists():
             return ToolResult(
                 tool_name=self.name,
@@ -87,6 +112,9 @@ class ReadFileTool(BaseTool):
                 content = "".join(lines[start_idx:end_idx])
             else:
                 content = "".join(lines)
+
+            if self.read_tracker is not None:
+                self.read_tracker.add(file_path)
 
             return ToolResult(
                 tool_name=self.name,
@@ -120,9 +148,15 @@ class WriteFileTool(BaseTool):
         self,
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
+        workspace_root: str | Path | None = None,
+        read_tracker: set[Path] | None = None,
+        require_read_before_overwrite: bool = False,
     ) -> None:
         self.checkpoint_store = checkpoint_store
         self.session_id_getter = session_id_getter
+        self.workspace_root = _normalize_workspace_root(workspace_root)
+        self.read_tracker = read_tracker
+        self.require_read_before_overwrite = require_read_before_overwrite
 
     async def execute(
         self,
@@ -131,9 +165,30 @@ class WriteFileTool(BaseTool):
         append: bool = False,
         **kwargs: Any,
     ) -> ToolResult:
-        file_path = Path(path).resolve()
+        file_path, err = validate_file_path(
+            path,
+            mode="write",
+            workspace_root=self.workspace_root,
+        )
+        if err is not None or file_path is None:
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=err or f"Invalid path: {path}",
+            )
         try:
             existed_before = file_path.exists() and file_path.is_file()
+            if (
+                existed_before
+                and self.require_read_before_overwrite
+                and self.read_tracker is not None
+                and file_path not in self.read_tracker
+            ):
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=f"Must read existing file with read_file before overwriting: {path}",
+                )
             before_text = ""
             if existed_before:
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -158,6 +213,9 @@ class WriteFileTool(BaseTool):
             mode = "a" if append else "w"
             with open(file_path, mode, encoding="utf-8") as f:
                 f.write(content)
+
+            if self.read_tracker is not None:
+                self.read_tracker.add(file_path)
 
             meta = _build_diff_metadata(path, before_text, after_text)
             if cp_id is not None:
@@ -190,8 +248,21 @@ class ListDirectoryTool(BaseTool):
         "required": [],
     }
 
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = _normalize_workspace_root(workspace_root)
+
     async def execute(self, path: str = ".", **kwargs: Any) -> ToolResult:
-        dir_path = Path(path).resolve()
+        dir_path, err = validate_file_path(
+            path,
+            mode="list",
+            workspace_root=self.workspace_root,
+        )
+        if err is not None or dir_path is None:
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=err or f"Invalid path: {path}",
+            )
         if not dir_path.exists():
             return ToolResult(
                 tool_name=self.name,
@@ -245,9 +316,15 @@ class PatchFileTool(BaseTool):
         self,
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
+        workspace_root: str | Path | None = None,
+        read_tracker: set[Path] | None = None,
+        require_read_before_overwrite: bool = False,
     ) -> None:
         self.checkpoint_store = checkpoint_store
         self.session_id_getter = session_id_getter
+        self.workspace_root = _normalize_workspace_root(workspace_root)
+        self.read_tracker = read_tracker
+        self.require_read_before_overwrite = require_read_before_overwrite
 
     async def execute(
         self,
@@ -256,12 +333,32 @@ class PatchFileTool(BaseTool):
         replacement: str,
         **kwargs: Any,
     ) -> ToolResult:
-        file_path = Path(path).resolve()
+        file_path, err = validate_file_path(
+            path,
+            mode="patch",
+            workspace_root=self.workspace_root,
+        )
+        if err is not None or file_path is None:
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=err or f"Invalid path: {path}",
+            )
         if not file_path.exists():
             return ToolResult(
                 tool_name=self.name,
                 status="error",
                 error=f"File not found: {path}",
+            )
+        if (
+            self.require_read_before_overwrite
+            and self.read_tracker is not None
+            and file_path not in self.read_tracker
+        ):
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=f"Must read file with read_file before patching: {path}",
             )
 
         try:
@@ -327,6 +424,9 @@ class SearchFilesTool(BaseTool):
         "required": ["pattern"],
     }
 
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = _normalize_workspace_root(workspace_root)
+
     async def execute(
         self,
         pattern: str,
@@ -334,7 +434,17 @@ class SearchFilesTool(BaseTool):
         max_results: int = 50,
         **kwargs: Any,
     ) -> ToolResult:
-        root = Path(path).resolve()
+        root, err = validate_file_path(
+            path,
+            mode="search",
+            workspace_root=self.workspace_root,
+        )
+        if err is not None or root is None:
+            return ToolResult(
+                tool_name=self.name,
+                status="error",
+                error=err or f"Invalid path: {path}",
+            )
         if not root.exists():
             return ToolResult(
                 tool_name=self.name,
@@ -356,9 +466,15 @@ class SearchFilesTool(BaseTool):
 
         try:
             for dirpath, dirnames, filenames in os.walk(root):
-                dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if d not in skip_dirs and not should_skip_sensitive_entry(Path(dirpath) / d)
+                ]
                 for filename in sorted(filenames):
                     file_path = Path(dirpath) / filename
+                    if should_skip_sensitive_entry(file_path):
+                        continue
                     try:
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             for lineno, line in enumerate(f, start=1):
@@ -394,18 +510,31 @@ class FileTools:
         self,
         checkpoint_store: FileCheckpointStore | None = None,
         session_id_getter: Callable[[], str] | None = None,
+        workspace_root: str | Path | None = None,
+        read_tracker: set[Path] | None = None,
+        require_read_before_overwrite: bool = False,
     ) -> None:
-        self.read_tool = ReadFileTool()
+        self._read_tracker: set[Path] = read_tracker if read_tracker is not None else set()
+        self.read_tool = ReadFileTool(
+            workspace_root=workspace_root,
+            read_tracker=self._read_tracker,
+        )
         self.write_tool = WriteFileTool(
             checkpoint_store=checkpoint_store,
             session_id_getter=session_id_getter,
+            workspace_root=workspace_root,
+            read_tracker=self._read_tracker,
+            require_read_before_overwrite=require_read_before_overwrite,
         )
-        self.list_tool = ListDirectoryTool()
+        self.list_tool = ListDirectoryTool(workspace_root=workspace_root)
         self.patch_tool = PatchFileTool(
             checkpoint_store=checkpoint_store,
             session_id_getter=session_id_getter,
+            workspace_root=workspace_root,
+            read_tracker=self._read_tracker,
+            require_read_before_overwrite=require_read_before_overwrite,
         )
-        self.search_tool = SearchFilesTool()
+        self.search_tool = SearchFilesTool(workspace_root=workspace_root)
 
     def register_all(self, registry: ToolRegistry) -> None:
         """Register read, write, list, patch, and search file tools into registry."""

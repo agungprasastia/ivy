@@ -159,9 +159,12 @@ def build_default_tool_registry(
     registry.register(TerminalTool(approval_policy=policy, process_manager=process_manager))
     if process_manager is not None:
         registry.register(ProcessManageTool(manager=process_manager))
+    workspace_root = Path.cwd().resolve() if config.restrict_workspace else None
     FileTools(
         checkpoint_store=checkpoint_store,
         session_id_getter=session_id_getter,
+        workspace_root=workspace_root,
+        require_read_before_overwrite=True,
     ).register_all(registry)
     registry.register(CodeRunnerTool(timeout=config.code_runner_timeout))
     registry.register(WebFetchTool())

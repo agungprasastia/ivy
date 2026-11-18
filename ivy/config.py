@@ -35,6 +35,8 @@ class IvyConfig(BaseModel):
 
     # Safety & execution
     auto_approve_safety: bool = False
+    restrict_workspace: bool = False
+    allow_private_urls: bool = False
     verbose: bool = False
     log_level: str = "INFO"
     default_theme: str = "ivy"
@@ -78,7 +80,7 @@ class IvyConfig(BaseModel):
             return [str(u).strip() for u in v if str(u).strip()]
         return []
 
-    @field_validator("auto_approve_safety", "verbose", mode="before")
+    @field_validator("auto_approve_safety", "restrict_workspace", "allow_private_urls", "verbose", mode="before")
     @classmethod
     def parse_bool(cls, v: Any) -> bool:
         if isinstance(v, str):
@@ -115,6 +117,8 @@ def load_config(env_file: str | Path | None = None) -> IvyConfig:
         "telegram_token": ["TELEGRAM_TOKEN"],
         "discord_token": ["DISCORD_TOKEN"],
         "auto_approve_safety": ["AUTO_APPROVE_SAFETY"],
+        "restrict_workspace": ["IVY_RESTRICT_WORKSPACE"],
+        "allow_private_urls": ["IVY_ALLOW_PRIVATE_URLS"],
         "verbose": ["VERBOSE"],
         "log_level": ["LOG_LEVEL"],
         "default_theme": ["IVY_THEME"],

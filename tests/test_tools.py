@@ -692,3 +692,84 @@ async def test_background_process_utf8_eviction_redaction_stdin_timeout_and_desc
             raise AssertionError(f"Descendant {child_pid} still alive after stop()")
         except ProcessLookupError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_path_security_blocks_sensitive_and_control_paths(tmp_path):
+    from ivy.tools.files import FileTools
+    from ivy.tools.path_security import validate_file_path
+
+    # Control chars / null bytes rejected
+    p, err = validate_file_path(str(tmp_path / "bad\x00file.txt"))
+    assert p is None and err is not None
+    p2, err2 = validate_file_path(str(tmp_path / "bad\nfile.txt"))
+    assert p2 is None and err2 is not None
+
+    ft = FileTools()
+    for rel in [".ssh/id_rsa", ".aws/credentials", ".env", ".env.local", ".git-credentials", ".netrc", ".npmrc", ".pypirc"]:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("SECRET=123", encoding="utf-8")
+
+        r_res = await ft.read_tool.execute(path=str(target))
+        assert r_res.status == "error", f"read should block {rel}"
+        w_res = await ft.write_tool.execute(path=str(target), content="x")
+        assert w_res.status == "error", f"write should block {rel}"
+
+    # Safe templates like .env.example remain readable and writable
+    example = tmp_path / ".env.example"
+    w_ok = await ft.write_tool.execute(path=str(example), content="API_KEY=\n")
+    assert w_ok.status == "success"
+    r_ok = await ft.read_tool.execute(path=str(example))
+    assert r_ok.status == "success" and "API_KEY=" in r_ok.output
+
+    # SearchFilesTool should skip sensitive dirs and .env files
+    safe_src = tmp_path / "app.py"
+    safe_src.write_text("SECRET_TOKEN_MARKER = 'visible'\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SECRET_TOKEN_MARKER=hidden\n", encoding="utf-8")
+    search_res = await ft.search_tool.execute(pattern="SECRET_TOKEN_MARKER", path=str(tmp_path))
+    assert search_res.status == "success"
+    assert "app.py" in search_res.output
+    assert ".env" not in search_res.output
+
+
+@pytest.mark.asyncio
+async def test_path_security_workspace_containment_and_read_before_write(tmp_path):
+    from ivy.tools.files import FileTools
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    # 1. Strict workspace containment blocks escape outside workspace_root
+    scoped = FileTools(workspace_root=ws, require_read_before_overwrite=True)
+    esc_read = await scoped.read_tool.execute(path=str(outside))
+    assert esc_read.status == "error" and "workspace" in (esc_read.error or "").lower()
+    esc_write = await scoped.write_tool.execute(path=str(ws / ".." / "outside.txt"), content="nope")
+    assert esc_write.status == "error"
+
+    # 2. Brand-new file inside workspace can be written without reading first, then patched immediately
+    brand_new = ws / "new.py"
+    w_new = await scoped.write_tool.execute(path=str(brand_new), content="x = 1\n")
+    assert w_new.status == "success"
+    p_after_new = await scoped.patch_tool.execute(path=str(brand_new), target="x = 1", replacement="x = 2")
+    assert p_after_new.status == "success"
+
+    # 3. Pre-existing unread file cannot be overwritten or patched until read_file succeeds
+    existing = ws / "existing.py"
+    existing.write_text("a = 10\n", encoding="utf-8")
+
+    w_unread = await scoped.write_tool.execute(path=str(existing), content="a = 99\n")
+    assert w_unread.status == "error" and "read_file" in (w_unread.error or "").lower()
+
+    p_unread = await scoped.patch_tool.execute(path=str(existing), target="a = 10", replacement="a = 20")
+    assert p_unread.status == "error" and "read_file" in (p_unread.error or "").lower()
+
+    r_ok = await scoped.read_tool.execute(path=str(existing))
+    assert r_ok.status == "success"
+
+    p_after_read = await scoped.patch_tool.execute(path=str(existing), target="a = 10", replacement="a = 20")
+    assert p_after_read.status == "success"
+    w_after_read = await scoped.write_tool.execute(path=str(existing), content="a = 30\n")
+    assert w_after_read.status == "success"

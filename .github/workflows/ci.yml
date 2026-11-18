@@ -58,7 +58,7 @@ jobs:
         run: uv sync --frozen --extra gateway
 
       - name: Run pytest suite
-        run: uv run pytest -p no:cacheprovider -v
+        run: uv run --no-sync pytest -p no:cacheprovider -v
 
       - name: Smoke check CLI help
-        run: uv run ivy --help
+        run: uv run --no-sync ivy --help

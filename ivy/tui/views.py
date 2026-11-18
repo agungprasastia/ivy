@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 from typing import Any
 
 from rich import box
@@ -598,6 +599,21 @@ def render_profile_table(
     console.print(table)
 
 
+def _format_checkpoint_path(raw_path: str, max_len: int = 52) -> str:
+    """Shorten checkpoint paths relative to cwd while keeping the trailing filename intact."""
+    shown = str(raw_path)
+    try:
+        p = Path(shown)
+        if p.is_absolute():
+            shown = str(p.resolve().relative_to(Path.cwd().resolve()))
+    except (OSError, ValueError):
+        pass
+    if len(shown) <= max_len:
+        return shown
+    tail_len = max(12, max_len - 17)
+    return f"{shown[:16]}…{shown[-tail_len:]}"
+
+
 def render_checkpoints_table(
     console: Console,
     checkpoints: list[Any],
@@ -624,7 +640,7 @@ def render_checkpoints_table(
             str(cp.id),
             cp.tool_name,
             kind,
-            escape(cp.display_path),
+            escape(_format_checkpoint_path(cp.display_path)),
             format_relative_time(cp.timestamp),
         )
     console.print(table)

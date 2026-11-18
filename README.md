@@ -2,14 +2,16 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ivy-mascot-dark.png">
     <source media="(prefers-color-scheme: light)" srcset=".github/assets/ivy-mascot.png">
-    <img src=".github/assets/ivy-mascot.png" width="380" alt="Ivy — Autonomous AI Agent">
+    <img src=".github/assets/ivy-mascot.png" width="230" alt="Ivy — Autonomous AI Agent">
   </picture>
 </p>
 
-<h1 align="center">Ivy</h1>
-
 <p align="center">
   Autonomous, self-improving Python agent. Built cleanly for Python 3.11+ and managed with Astral <code>uv</code>.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-10B981.svg" alt="License: Apache-2.0" /></a>
 </p>
 
 ---

@@ -9,6 +9,7 @@ from ivy.core.llm import LLMClient
 from ivy.core.types import ChatMessage, Role
 from ivy.skills.engine import SkillEngine
 from ivy.skills.format import SkillDefinition, parse_skill_markdown
+from ivy.skills.guard import format_scan_rejection, scan_skill_content
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,11 @@ class SkillGenerator:
             skill = parse_skill_markdown(raw)
         except Exception as exc:
             logger.warning("Skill reflection produced malformed SKILL.md: %s", exc)
+            return None
+
+        scan = scan_skill_content(skill.name, skill.description, skill.instructions)
+        if not scan.safe:
+            logger.warning("Skill reflection blocked by guard (%s): %s", skill.name, format_scan_rejection(scan))
             return None
 
         self.skill_engine.save_skill(skill)

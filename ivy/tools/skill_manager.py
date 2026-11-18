@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from ivy.core.types import ToolResult
 from ivy.skills.format import SkillDefinition
+from ivy.skills.guard import format_scan_rejection, scan_skill_content
 from ivy.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -92,6 +93,13 @@ class SkillManagerTool(BaseTool):
                     tool_name=self.name,
                     status="error",
                     error="Both 'description' and 'instructions' are required.",
+                )
+            scan = scan_skill_content(clean_name, desc, instr)
+            if not scan.safe:
+                return ToolResult(
+                    tool_name=self.name,
+                    status="error",
+                    error=format_scan_rejection(scan),
                 )
             try:
                 path = self.skill_engine.save_skill(
